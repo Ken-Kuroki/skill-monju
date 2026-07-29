@@ -149,9 +149,10 @@ PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
 NOTIFICATION_WEBHOOK_ENV = "MONJU_NOTIFY_WEBHOOK_URL"
 NOTIFICATION_TIMEOUT_SECONDS = 10
-INTERNAL_WORKER_ENV = "MONJU_INTERNAL_WORKER"
-BACKGROUND_STARTUP_GRACE_SECONDS = 2.0
-BACKGROUND_STARTUP_POLL_SECONDS = 0.05
+EXECUTION_MODE = "foreground_supervisor"
+IGNORED_STARTUP_STDERR_FRAGMENTS = (
+    "warning: setlocale: LC_ALL: cannot change locale",
+)
 
 
 @dataclass
@@ -254,7 +255,10 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument(
         "--background",
         action="store_true",
-        help="Start the review supervisor in the background and return immediately.",
+        help=(
+            "Deprecated and rejected: run the supervisor in the foreground of a "
+            "Codex background terminal instead."
+        ),
     )
     mode.add_argument(
         "--status",
@@ -266,7 +270,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print exact reviewer command templates without invoking Cursor.",
     )
-    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -529,21 +532,13 @@ def process_is_running(pid: int) -> bool:
         return windows_process_is_running(pid)
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
     return True
-
-
-def detached_process_options() -> dict[str, Any]:
-    if os.name == "nt":
-        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-        new_process_group = getattr(
-            subprocess,
-            "CREATE_NEW_PROCESS_GROUP",
-            0x00000200,
-        )
-        return {"creationflags": detached_process | new_process_group}
-    return {"start_new_session": True}
 
 
 def make_run_id() -> str:
@@ -812,7 +807,6 @@ def run_reviewer(
     exit_code = 127
     reviewer_environment = os.environ.copy()
     reviewer_environment.pop(NOTIFICATION_WEBHOOK_ENV, None)
-    reviewer_environment.pop(INTERNAL_WORKER_ENV, None)
 
     with events_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         try:
@@ -823,6 +817,8 @@ def run_reviewer(
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
+                # Isolate each reviewer only for bounded process-group cleanup.
+                # The supervisor itself remains in the caller's foreground.
                 start_new_session=True,
             )
             coordinator.register(reviewer.ordinal, proc)
@@ -1002,6 +998,8 @@ def write_running_manifest(
         ).hexdigest(),
         "reasoning_policy": REASONING_POLICY,
         "parallel_reviewer_count": len(REVIEWERS),
+        "execution_mode": EXECUTION_MODE,
+        "supervisor_pid": os.getpid(),
         "notification": notification_pending(notification_mode),
         "results": [],
     }
@@ -1033,6 +1031,8 @@ def write_final_manifest(
         ).hexdigest(),
         "reasoning_policy": REASONING_POLICY,
         "parallel_reviewer_count": len(REVIEWERS),
+        "execution_mode": EXECUTION_MODE,
+        "supervisor_pid": os.getpid(),
         "interrupted_signal": interrupted_signal,
         "notification": notification_pending(notification_mode),
         "results": [asdict(result) for result in results],
@@ -1545,6 +1545,96 @@ def prepare_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def has_meaningful_startup_stderr(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(
+            fragment in stripped
+            for fragment in IGNORED_STARTUP_STDERR_FRAGMENTS
+        ):
+            continue
+        return True
+    return False
+
+
+def diagnose_stale_run(run_dir: Path, run_id: str) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "reason": "external_termination_before_startup",
+        "reviewers_with_events": 0,
+        "initialized_reviewers": 0,
+        "completed_reviewers": 0,
+        "startup_error_reviewers": 0,
+        "supervisor_stderr": False,
+        "staging_preserved": None,
+    }
+    pointer = run_dir / f".{run_id}-staging"
+    try:
+        staging_dir = Path(pointer.read_text(encoding="utf-8").strip())
+    except OSError:
+        return diagnostics
+    diagnostics["staging_preserved"] = str(staging_dir)
+
+    event_bytes = 0
+    for reviewer in REVIEWERS:
+        stem = f"{run_id}-{reviewer.ordinal:02d}-{reviewer.key}"
+        events_path = staging_dir / f"{stem}.events.jsonl"
+        stderr_path = staging_dir / f"{stem}.stderr.log"
+        try:
+            event_size = events_path.stat().st_size
+        except OSError:
+            event_size = 0
+        if event_size:
+            diagnostics["reviewers_with_events"] += 1
+            event_bytes += event_size
+        try:
+            reported_model, _, final_text, stream_error, _ = parse_event_stream(
+                events_path
+            )
+        except OSError:
+            reported_model = None
+            final_text = None
+            stream_error = None
+        if model_matches(reviewer, reported_model):
+            diagnostics["initialized_reviewers"] += 1
+        if final_text:
+            diagnostics["completed_reviewers"] += 1
+        try:
+            stderr_text = stderr_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            stderr_text = ""
+        if stream_error or has_meaningful_startup_stderr(stderr_text):
+            diagnostics["startup_error_reviewers"] += 1
+
+    supervisor_stderr_path = run_dir / f"{run_id}-runner.stderr.log"
+    try:
+        supervisor_stderr = supervisor_stderr_path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        supervisor_stderr = ""
+    diagnostics["supervisor_stderr"] = has_meaningful_startup_stderr(
+        supervisor_stderr
+    )
+
+    if diagnostics["completed_reviewers"]:
+        diagnostics["reason"] = "external_termination_after_results"
+    elif diagnostics["initialized_reviewers"]:
+        diagnostics["reason"] = "external_termination_after_startup"
+    elif (
+        diagnostics["startup_error_reviewers"]
+        or diagnostics["supervisor_stderr"]
+        or event_bytes
+    ):
+        diagnostics["reason"] = "startup_failure"
+    return diagnostics
+
+
 def read_status(args: argparse.Namespace) -> int:
     if args.run_dir is None:
         raise SystemExit("--status requires --run-dir")
@@ -1566,6 +1656,7 @@ def read_status(args: argparse.Namespace) -> int:
     runner_pid: str | None = None
     if pid_file.is_file():
         runner_pid = pid_file.read_text(encoding="utf-8").strip()
+    stale_diagnostics: dict[str, Any] | None = None
     if status == "running" and runner_pid:
         try:
             runner_running = process_is_running(int(runner_pid))
@@ -1573,11 +1664,30 @@ def read_status(args: argparse.Namespace) -> int:
             runner_running = False
         if not runner_running:
             status = "stale_running"
+            stale_diagnostics = diagnose_stale_run(run_dir, run_id)
     print(f"RUN_DIR={run_dir}")
     print(f"STATUS={status}")
     print(f"MANIFEST={path}")
     if runner_pid:
         print(f"RUNNER_PID={runner_pid}")
+    if stale_diagnostics is not None:
+        print(f"STALE_REASON={stale_diagnostics['reason']}")
+        print(
+            "STALE_PROGRESS="
+            f"events:{stale_diagnostics['reviewers_with_events']}/"
+            f"{len(REVIEWERS)} "
+            f"initialized:{stale_diagnostics['initialized_reviewers']}/"
+            f"{len(REVIEWERS)} "
+            f"completed:{stale_diagnostics['completed_reviewers']}/"
+            f"{len(REVIEWERS)} "
+            f"startup_errors:{stale_diagnostics['startup_error_reviewers']}/"
+            f"{len(REVIEWERS)} "
+            "supervisor_stderr:"
+            f"{int(stale_diagnostics['supervisor_stderr'])}"
+        )
+        staging_preserved = stale_diagnostics["staging_preserved"]
+        if staging_preserved:
+            print(f"STAGING_PRESERVED={staging_preserved}")
     for result in payload.get("results", []):
         if not isinstance(result, dict):
             continue
@@ -1620,7 +1730,7 @@ def dry_run(args: argparse.Namespace) -> int:
         "run_dir": str(run_dir) if run_dir else None,
         "output_root": str(output_root),
         "parallel": True,
-        "background": bool(args.background),
+        "execution_mode": EXECUTION_MODE,
         "notification": {
             "mode": args.notify,
             "webhook_env": NOTIFICATION_WEBHOOK_ENV,
@@ -1641,168 +1751,13 @@ def dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_worker_command(
-    workspace: Path,
-    prompt_file: Path,
-    run_dir: Path,
-    agent_bin: str,
-    timeout_seconds: int,
-    notification_mode: str,
-) -> list[str]:
-    return [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--_worker",
-        "--workspace",
-        str(workspace),
-        "--prompt-file",
-        str(prompt_file),
-        "--run-dir",
-        str(run_dir),
-        "--agent-bin",
-        agent_bin,
-        "--timeout-seconds",
-        str(timeout_seconds),
-        "--notify",
-        notification_mode,
-    ]
-
-
-def reviewers_initialized(run_dir: Path, run_id: str) -> bool:
-    pointer = run_dir / f".{run_id}-staging"
-    try:
-        staging_dir = Path(pointer.read_text(encoding="utf-8").strip())
-    except OSError:
-        return False
-    for reviewer in REVIEWERS:
-        events_path = staging_dir / (
-            f"{run_id}-{reviewer.ordinal:02d}-{reviewer.key}.events.jsonl"
-        )
-        try:
-            reported_model, _, _, _, _ = parse_event_stream(events_path)
-        except OSError:
-            return False
-        if not model_matches(reviewer, reported_model):
-            return False
-    return True
-
-
-def terminal_manifest_status(run_dir: Path, run_id: str) -> str | None:
-    path = manifest_path(run_dir, run_id)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    status = payload.get("status")
-    if not isinstance(status, str) or status == "running":
-        return None
-    return status
-
-
-def wait_for_background_startup(
-    proc: subprocess.Popen[bytes],
-    run_dir: Path,
-    run_id: str,
-) -> tuple[str, str | None]:
-    deadline = time.monotonic() + BACKGROUND_STARTUP_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        if reviewers_initialized(run_dir, run_id):
-            return "confirmed", None
-        status = terminal_manifest_status(run_dir, run_id)
-        if status is not None:
-            return "failed", status
-        time.sleep(BACKGROUND_STARTUP_POLL_SECONDS)
-
-    status = terminal_manifest_status(run_dir, run_id)
-    if status is not None:
-        return "failed", status
-    if proc.poll() is not None:
-        return "failed", "stale_running"
-    return "pending", None
-
-
-def background_terminal_exit_code(status: str) -> int:
-    return {
-        "success": 0,
-        "partial_failure": 3,
-        "failure": 4,
-        "interrupted": 130,
-        "artifact_failure": 74,
-        "supervisor_failure": 70,
-        "stale_running": 70,
-    }.get(status, 70)
-
-
-def launch_background(
-    workspace: Path,
-    prompt_file: Path,
-    run_dir: Path,
-    run_id: str,
-    agent_bin: str,
-    timeout_seconds: int,
-    review_brief: str,
-    effective_prompt: str,
-    notification_mode: str,
-) -> int:
-    marker = claim_run(run_dir)
-    started_at = iso_now()
-    copy_prompt_artifacts(run_dir, run_id, review_brief, effective_prompt)
-    write_running_manifest(
-        run_dir,
-        run_id,
-        workspace,
-        default_prompt_path(run_dir, run_id),
-        effective_prompt,
-        started_at,
-        notification_mode,
-    )
-
-    stdout_path = run_dir / f"{run_id}-runner.stdout.log"
-    stderr_path = run_dir / f"{run_id}-runner.stderr.log"
-    worker_command = build_worker_command(
-        workspace,
-        default_prompt_path(run_dir, run_id),
-        run_dir,
-        agent_bin,
-        timeout_seconds,
-        notification_mode,
-    )
-    try:
-        with (
-            stdout_path.open("ab") as stdout_file,
-            stderr_path.open("ab") as stderr_file,
-        ):
-            worker_environment = os.environ.copy()
-            worker_environment[INTERNAL_WORKER_ENV] = "1"
-            proc = subprocess.Popen(
-                worker_command,
-                cwd=workspace,
-                env=worker_environment,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                close_fds=True,
-                **detached_process_options(),
-            )
-    except OSError:
-        marker.unlink(missing_ok=True)
-        raise
-
-    pid_path = run_dir / f"{run_id}-runner.pid"
-    atomic_write_text(pid_path, f"{proc.pid}\n")
-    startup, terminal_status = wait_for_background_startup(proc, run_dir, run_id)
+def announce_foreground_run(run_dir: Path, run_id: str) -> None:
     print(f"RUN_DIR={run_dir}")
-    if terminal_status is not None:
-        print(f"STATUS={terminal_status}")
-        print("STARTUP=failed")
-    else:
-        print("STATUS=running")
-        print(f"STARTUP={startup}")
-    print(f"RUNNER_PID={proc.pid}")
+    print("STATUS=running")
+    print(f"EXECUTION_MODE={EXECUTION_MODE}")
+    print(f"RUNNER_PID={os.getpid()}")
     print(f"MANIFEST={manifest_path(run_dir, run_id)}")
-    if terminal_status is not None:
-        return background_terminal_exit_code(terminal_status)
-    return 0
+    sys.stdout.flush()
 
 
 def run_requested_review(args: argparse.Namespace) -> int:
@@ -1818,45 +1773,32 @@ def run_requested_review(args: argparse.Namespace) -> int:
 
     prompt_file = resolve_prompt_file(args, run_dir, run_id)
     canonical_prompt = default_prompt_path(run_dir, run_id)
-    if args._worker:
-        if prompt_file != canonical_prompt:
-            raise SystemExit("internal worker requires the canonical run prompt")
-        if not (run_dir / ".monju-started").is_file():
-            raise SystemExit("internal worker requires a claimed run directory")
     review_brief, effective_prompt = read_review_brief(prompt_file)
     agent_bin = resolve_executable(args.agent_bin)
     run_preflight_checks(workspace, agent_bin)
 
-    if args.background:
-        return launch_background(
-            workspace,
-            canonical_prompt,
-            run_dir,
-            run_id,
-            agent_bin,
-            args.timeout_seconds,
-            review_brief,
-            effective_prompt,
-            args.notify,
-        )
-
-    if not args._worker:
-        claim_run(run_dir)
-        copy_prompt_artifacts(
-            run_dir,
-            run_id,
-            review_brief,
-            effective_prompt,
-        )
-        write_running_manifest(
-            run_dir,
-            run_id,
-            workspace,
-            canonical_prompt,
-            effective_prompt,
-            iso_now(),
-            args.notify,
-        )
+    run_started_at = iso_now()
+    claim_run(run_dir)
+    copy_prompt_artifacts(
+        run_dir,
+        run_id,
+        review_brief,
+        effective_prompt,
+    )
+    write_running_manifest(
+        run_dir,
+        run_id,
+        workspace,
+        canonical_prompt,
+        effective_prompt,
+        run_started_at,
+        args.notify,
+    )
+    atomic_write_text(
+        run_dir / f"{run_id}-runner.pid",
+        f"{os.getpid()}\n",
+    )
+    announce_foreground_run(run_dir, run_id)
 
     return execute_reviews(
         workspace=workspace,
@@ -1867,7 +1809,7 @@ def run_requested_review(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout_seconds,
         review_brief=review_brief,
         effective_prompt=effective_prompt,
-        run_started_at=iso_now(),
+        run_started_at=run_started_at,
         notification_mode=args.notify,
     )
 
@@ -1878,8 +1820,12 @@ def main() -> int:
     args = parse_args()
     validate_quality_policy()
 
-    if args._worker and os.environ.get(INTERNAL_WORKER_ENV) != "1":
-        raise SystemExit("--_worker is reserved for the detached Monju supervisor")
+    if args.background:
+        raise SystemExit(
+            "--background is unsafe under Codex process cleanup and is no longer "
+            "supported. Omit it and keep this runner in the foreground of a Codex "
+            "unified-exec background terminal."
+        )
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be greater than zero")
     if args.preflight:
@@ -1892,26 +1838,6 @@ def main() -> int:
         return dry_run(args)
     try:
         return run_requested_review(args)
-    except SystemExit as exc:
-        if not args._worker:
-            raise
-        if args.run_dir is not None:
-            try:
-                run_id, run_dir = validate_run_dir(args.run_dir)
-                write_supervisor_failure_manifest(run_dir, run_id, exc)
-                notify_terminal_status(
-                    args.notify,
-                    run_dir,
-                    run_id,
-                    "supervisor_failure",
-                )
-            except Exception as manifest_exc:  # noqa: BLE001 - diagnostics only.
-                print(
-                    f"could not record worker startup failure: {manifest_exc}",
-                    file=sys.stderr,
-                )
-        print(f"worker startup failed: {exc}", file=sys.stderr)
-        return 70
     except Exception as exc:  # noqa: BLE001 - record unexpected supervisor exits.
         if args.run_dir is not None:
             try:

@@ -134,7 +134,6 @@ class RunnerTestCase(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         command_env = os.environ.copy()
         command_env["AGENT_CLI_CREDENTIAL_STORE"] = "file"
-        command_env.pop(run_monju.INTERNAL_WORKER_ENV, None)
         command_env["HOME"] = str(self.test_home)
         if env:
             command_env.update(env)
@@ -554,13 +553,16 @@ class RunnerTestCase(unittest.TestCase):
         windows_probe.assert_called_once_with(1234)
         kill.assert_not_called()
 
-    def test_windows_background_options_detach_process(self) -> None:
-        with mock.patch.object(run_monju.os, "name", "nt"):
-            options = run_monju.detached_process_options()
-
-        self.assertNotIn("start_new_session", options)
-        self.assertTrue(options["creationflags"] & 0x00000008)
-        self.assertTrue(options["creationflags"] & 0x00000200)
+    def test_posix_permission_denied_liveness_probe_is_conservative(self) -> None:
+        with (
+            mock.patch.object(run_monju.os, "name", "posix"),
+            mock.patch.object(
+                run_monju.os,
+                "kill",
+                side_effect=PermissionError("sandbox denied process inspection"),
+            ),
+        ):
+            self.assertTrue(run_monju.process_is_running(1234))
 
     def test_notification_failure_does_not_change_review_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -637,7 +639,77 @@ class RunnerTestCase(unittest.TestCase):
             )
             self.assertEqual(manifest["status"], "success")
 
-    def test_background_run_returns_then_completes(self) -> None:
+    def test_foreground_supervisor_announces_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            output = root / "reviews"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+            run_dir, prompt = self.prepare(workspace, output)
+            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "AGENT_CLI_CREDENTIAL_STORE": "file",
+                    "FAKE_AGENT_SLEEP": "0.7",
+                    "HOME": str(self.test_home),
+                }
+            )
+            self.trust_workspace(workspace, self.test_home)
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--workspace",
+                    str(workspace),
+                    "--run-dir",
+                    str(run_dir),
+                    "--prompt-file",
+                    str(prompt),
+                    "--agent-bin",
+                    str(fake),
+                ],
+                cwd=REPOSITORY,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if manifest_path.is_file():
+                        payload = json.loads(
+                            manifest_path.read_text(encoding="utf-8")
+                        )
+                        if payload.get("status") == "running":
+                            break
+                    time.sleep(0.02)
+                else:
+                    self.fail("foreground supervisor never announced running")
+
+                self.assertIsNone(proc.poll())
+                self.assertEqual(
+                    (run_dir / f"{run_dir.name}-runner.pid")
+                    .read_text(encoding="utf-8")
+                    .strip(),
+                    str(proc.pid),
+                )
+                stdout, stderr = proc.communicate(timeout=8)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertIn("STATUS=running", stdout)
+            self.assertIn("EXECUTION_MODE=foreground_supervisor", stdout)
+            self.assertIn("STATUS=success", stdout)
+
+    def test_background_flag_is_rejected_without_claiming_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -647,7 +719,6 @@ class RunnerTestCase(unittest.TestCase):
             run_dir, prompt = self.prepare(workspace, output)
             prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
 
-            started = time.monotonic()
             result = self.run_command(
                 "--background",
                 "--workspace",
@@ -658,28 +729,16 @@ class RunnerTestCase(unittest.TestCase):
                 str(prompt),
                 "--agent-bin",
                 str(fake),
-                "--notify",
-                "webhook",
-                env={
-                    "FAKE_AGENT_SLEEP": "0.3",
-                    run_monju.NOTIFICATION_WEBHOOK_ENV: "",
-                },
             )
-            elapsed = time.monotonic() - started
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertLess(elapsed, 2)
-            self.assertIn("STATUS=running", result.stdout)
-            self.assertIn("STARTUP=confirmed", result.stdout)
-            manifest = self.wait_for_terminal_manifest(run_dir)
-            self.assertEqual(manifest["status"], "success")
-            self.assertEqual(manifest["notification"]["status"], "failed")
 
-            status = self.run_command("--status", "--run-dir", str(run_dir))
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("STATUS=success", status.stdout)
-            self.assertIn("NOTIFICATION=failed BACKEND=webhook", status.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--background is unsafe under Codex", result.stderr)
+            self.assertFalse((run_dir / ".monju-started").exists())
+            self.assertFalse(
+                (run_dir / f"{run_dir.name}-manifest.json").exists()
+            )
 
-    def test_background_reports_immediate_startup_failure(self) -> None:
+    def test_foreground_reports_immediate_startup_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -690,7 +749,6 @@ class RunnerTestCase(unittest.TestCase):
             prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
 
             result = self.run_command(
-                "--background",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -704,8 +762,6 @@ class RunnerTestCase(unittest.TestCase):
 
             self.assertEqual(result.returncode, 4, result.stderr)
             self.assertIn("STATUS=failure", result.stdout)
-            self.assertIn("STARTUP=failed", result.stdout)
-            self.assertNotIn("STATUS=running", result.stdout)
             manifest = json.loads(
                 (run_dir / f"{run_dir.name}-manifest.json").read_text(
                     encoding="utf-8"
@@ -720,33 +776,7 @@ class RunnerTestCase(unittest.TestCase):
                 )
             )
 
-    def test_background_startup_grace_can_return_pending(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir = Path(temporary)
-            proc = mock.Mock()
-            proc.poll.return_value = None
-            with (
-                mock.patch.object(
-                    run_monju,
-                    "BACKGROUND_STARTUP_GRACE_SECONDS",
-                    0.01,
-                ),
-                mock.patch.object(
-                    run_monju,
-                    "BACKGROUND_STARTUP_POLL_SECONDS",
-                    0.001,
-                ),
-            ):
-                startup, status = run_monju.wait_for_background_startup(
-                    proc,
-                    run_dir,
-                    "monju-test",
-                )
-
-            self.assertEqual(startup, "pending")
-            self.assertIsNone(status)
-
-    def test_background_does_not_claim_run_before_trust_preflight(self) -> None:
+    def test_foreground_does_not_claim_run_before_trust_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -761,7 +791,6 @@ class RunnerTestCase(unittest.TestCase):
                 marker.unlink()
 
             result = self.run_command(
-                "--background",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -792,7 +821,6 @@ class RunnerTestCase(unittest.TestCase):
             prompt.write_text(original, encoding="utf-8")
 
             first = self.run_command(
-                "--background",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -808,7 +836,6 @@ class RunnerTestCase(unittest.TestCase):
             replacement = root / "replacement.md"
             replacement.write_text("# Review\nReplacement scope.", encoding="utf-8")
             second = self.run_command(
-                "--background",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -823,42 +850,6 @@ class RunnerTestCase(unittest.TestCase):
             self.assertIn("already started", second.stderr)
             self.assertEqual(prompt.read_text(encoding="utf-8").strip(), original)
             self.assertEqual(self.wait_for_terminal_manifest(run_dir)["status"], "success")
-
-    def test_internal_worker_flag_cannot_be_invoked_directly(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            original = "# Review\nOriginal scope."
-            prompt.write_text(original, encoding="utf-8")
-            (run_dir / ".monju-started").write_text(
-                run_monju.iso_now() + "\n",
-                encoding="utf-8",
-            )
-
-            replacement = root / "replacement.md"
-            replacement.write_text("# Review\nReplacement scope.", encoding="utf-8")
-            result = self.run_command(
-                "--_worker",
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(replacement),
-                "--agent-bin",
-                str(fake),
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("reserved for the detached Monju supervisor", result.stderr)
-            self.assertEqual(prompt.read_text(encoding="utf-8"), original)
-            self.assertFalse(
-                (run_dir / f"{run_dir.name}-manifest.json").exists()
-            )
 
     def test_status_reports_dead_runner_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -881,6 +872,104 @@ class RunnerTestCase(unittest.TestCase):
 
             self.assertEqual(status.returncode, 0, status.stderr)
             self.assertIn("STATUS=stale_running", status.stdout)
+            self.assertIn(
+                "STALE_REASON=external_termination_before_startup",
+                status.stdout,
+            )
+
+    def test_status_identifies_external_termination_after_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            output = root / "reviews"
+            staging = root / "staging"
+            workspace.mkdir()
+            staging.mkdir()
+            run_dir, _ = self.prepare(workspace, output)
+            (run_dir / f"{run_dir.name}-manifest.json").write_text(
+                json.dumps({"status": "running", "results": []}),
+                encoding="utf-8",
+            )
+            (run_dir / f"{run_dir.name}-runner.pid").write_text(
+                "2147483647\n",
+                encoding="utf-8",
+            )
+            (run_dir / f".{run_dir.name}-staging").write_text(
+                str(staging),
+                encoding="utf-8",
+            )
+            for reviewer in run_monju.REVIEWERS:
+                stem = (
+                    f"{run_dir.name}-{reviewer.ordinal:02d}-{reviewer.key}"
+                )
+                (staging / f"{stem}.events.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "model": reviewer.allowed_reported_models[-1],
+                            "session_id": f"session-{reviewer.key}",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (staging / f"{stem}.stderr.log").write_text(
+                    "bash: warning: setlocale: LC_ALL: cannot change locale "
+                    "(C.UTF-8): Bad file descriptor\n",
+                    encoding="utf-8",
+                )
+
+            status = self.run_command("--status", "--run-dir", str(run_dir))
+
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn("STATUS=stale_running", status.stdout)
+            self.assertIn(
+                "STALE_REASON=external_termination_after_startup",
+                status.stdout,
+            )
+            self.assertIn("initialized:3/3", status.stdout)
+            self.assertIn("startup_errors:0/3", status.stdout)
+            self.assertIn(f"STAGING_PRESERVED={staging}", status.stdout)
+
+    def test_status_identifies_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            output = root / "reviews"
+            staging = root / "staging"
+            workspace.mkdir()
+            staging.mkdir()
+            run_dir, _ = self.prepare(workspace, output)
+            (run_dir / f"{run_dir.name}-manifest.json").write_text(
+                json.dumps({"status": "running", "results": []}),
+                encoding="utf-8",
+            )
+            (run_dir / f"{run_dir.name}-runner.pid").write_text(
+                "2147483647\n",
+                encoding="utf-8",
+            )
+            (run_dir / f".{run_dir.name}-staging").write_text(
+                str(staging),
+                encoding="utf-8",
+            )
+            for reviewer in run_monju.REVIEWERS:
+                stem = (
+                    f"{run_dir.name}-{reviewer.ordinal:02d}-{reviewer.key}"
+                )
+                (staging / f"{stem}.events.jsonl").touch()
+                (staging / f"{stem}.stderr.log").write_text(
+                    "Workspace Trust Required\n",
+                    encoding="utf-8",
+                )
+
+            status = self.run_command("--status", "--run-dir", str(run_dir))
+
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn("STATUS=stale_running", status.stdout)
+            self.assertIn("STALE_REASON=startup_failure", status.stdout)
+            self.assertIn("initialized:0/3", status.stdout)
+            self.assertIn("startup_errors:3/3", status.stdout)
 
     def test_bad_agent_path_records_supervisor_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -892,7 +981,6 @@ class RunnerTestCase(unittest.TestCase):
             prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
 
             result = self.run_command(
-                "--background",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -1062,52 +1150,6 @@ class RunnerTestCase(unittest.TestCase):
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "interrupted")
             self.assertEqual(len(payload["results"]), 3)
-
-    @unittest.skipIf(os.name != "posix", "POSIX signal behavior")
-    def test_background_sigterm_publishes_interrupted_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            started = self.run_command(
-                "--background",
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(fake),
-                env={"FAKE_AGENT_SLEEP": "20"},
-            )
-            self.assertEqual(started.returncode, 0, started.stderr)
-            runner_pid = int(self.parse_key(started.stdout, "RUNNER_PID"))
-
-            pointer = run_dir / f".{run_dir.name}-staging"
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if pointer.is_file():
-                    staging = Path(pointer.read_text(encoding="utf-8").strip())
-                    if any(staging.glob("*.events.jsonl")):
-                        break
-                time.sleep(0.05)
-            else:
-                os.kill(runner_pid, signal.SIGKILL)
-                self.fail("background worker never started reviewer processes")
-
-            os.kill(runner_pid, signal.SIGTERM)
-            manifest = self.wait_for_terminal_manifest(run_dir)
-
-            self.assertEqual(manifest["status"], "interrupted")
-            self.assertEqual(manifest["interrupted_signal"], signal.SIGTERM)
-            self.assertEqual(len(manifest["results"]), 3)
-
 
 if __name__ == "__main__":
     unittest.main()

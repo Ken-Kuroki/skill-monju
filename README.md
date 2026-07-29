@@ -25,9 +25,9 @@ The concrete review brief is generated for each task by Codex. The runner keeps
 the model selection, highest non-Fast model IDs, read-only mode, prompt envelope,
 parallel execution, and output filenames deterministic.
 
-Reviews normally take several minutes or longer. Codex launches the detached
-supervisor, returns immediately, and checks and aggregates results in a later
-conversation turn.
+Reviews normally take several minutes or longer. Codex keeps the supervisor in
+the foreground of a managed background terminal, ends the launch turn without
+polling, and checks and aggregates results in a later conversation turn.
 
 Monju is suitable for:
 
@@ -198,15 +198,22 @@ Use $monju to review this design document. Identify ambiguous requirements and
 propose any experiments that would resolve important uncertainties.
 ```
 
-Codex creates a task-specific review brief in a unique run directory and launches
-Monju in the background. It does not wait or poll in that turn. In a later turn,
-ask Codex to check the saved run; it reads the three results, verifies material
-findings against the source, and reports consensus, unique findings,
-disagreements, and unexecuted experiment proposals.
+Codex creates a task-specific review brief in a unique run directory and runs
+Monju as the foreground command of a Codex background terminal. It does not wait
+or poll in that turn. In a later turn, ask Codex to check the saved run; it reads
+the three results, verifies material findings against the source, and reports
+consensus, unique findings, disagreements, and unexecuted experiment proposals.
+
+Invoking Monju is itself authorization for the scoped read-only review,
+preflight, artifact creation, and exact-workspace trust registration when
+needed. Codex must not ask again in chat before proceeding. If sandbox escalation
+is required, Codex submits the exact tool call directly and the platform may show
+its approval popup. Authentication or SSO that genuinely requires user action
+remains a blocking exception.
 
 ### Direct runner invocation
 
-Codex normally invokes the runner automatically. A manual asynchronous run
+Codex normally invokes the runner automatically. Its asynchronous workflow
 starts with a preflight:
 
 ```bash
@@ -221,8 +228,8 @@ The preflight performs an actual create-and-delete write probe in the relevant
 and checks file-store authentication. If it reports
 `PREFLIGHT=cursor_state_unwritable`, rerun both preflight and launch outside the
 filesystem sandbox. If it reports `PREFLIGHT=workspace_trust_required`, Codex
-requests narrowly scoped approval and runs the following command outside the
-sandbox with a PTY:
+directly submits a narrowly scoped platform approval request and runs the
+following command outside the sandbox with a PTY:
 
 ```bash
 AGENT_CLI_CREDENTIAL_STORE=file \
@@ -231,6 +238,9 @@ agent --workspace "/absolute/path/to/workspace" --trust
 
 The user does not need to open a terminal. Once Cursor reaches its initial
 prompt, Codex interrupts it without submitting a prompt and reruns preflight.
+Codex does not ask for a separate conversational confirmation before submitting
+the platform approval request. Invoking Monju already authorizes trust
+registration for the exact workspace.
 The approval must name the exact workspace being persistently trusted. Do not
 use `--yolo` or `--force`, request a broad reusable approval, or edit Cursor's
 trust marker directly.
@@ -244,23 +254,23 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
   --output-root "/absolute/path/to/output"
 ```
 
-Write the review brief to the printed `PROMPT_FILE`, then start it:
+Write the review brief to the printed `PROMPT_FILE`, then use one Codex unified
+exec session to start the following command with a short initial yield:
 
 ```bash
 AGENT_CLI_CREDENTIAL_STORE=file \
 uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --background \
   --notify auto \
   --workspace "/absolute/path/to/workspace" \
   --run-dir "/absolute/path/from/RUN_DIR" \
   --prompt-file "/absolute/path/from/PROMPT_FILE"
 ```
 
-The launcher waits only for a short startup grace period. `STARTUP=confirmed`
-means all three requested models emitted verified initialization events.
-`STARTUP=pending` means the detached supervisor is alive but initialization was
-not yet confirmed. A terminal `STATUS` with `STARTUP=failed` means the reviewers
-failed immediately and must not be treated as a successful background launch.
+Keep this runner in the exec session's foreground. When the tool yields a live
+session ID after about three seconds, Codex can end its turn without polling;
+the managed background terminal continues owning the supervisor. Do not add
+`&`, `nohup`, `setsid`, or `--background`. A human invoking the command directly
+must leave that terminal command running until review completion.
 
 Check it later without waiting:
 
@@ -271,14 +281,18 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 ```
 
 `--status` reports `stale_running` when a run still says `running` but its
-recorded supervisor process no longer exists.
+recorded supervisor process no longer exists. It also reports `STALE_REASON`,
+reviewer progress counts, and the preserved staging path. Initialized or
+completed reviewers indicate external termination after real progress; meaningful
+stderr without any initialization indicates startup failure. The known
+`LC_ALL=C.UTF-8` locale warning is ignored for this classification.
 
 Runner options:
 
 ```text
 --preflight             Check Cursor state access, workspace trust, and authentication
 --prepare               Create a unique run directory and empty brief
---background            Start the detached supervisor and return immediately
+--background            Rejected; use a foreground Codex background terminal
 --status                Read current status without waiting
 --run-dir PATH          Prepared run directory
 --agent-bin PATH        Cursor CLI executable; default: agent
@@ -293,9 +307,9 @@ and any questions the reviewers must answer.
 
 ### Completion notifications
 
-Notifications run inside the detached supervisor after a terminal manifest has
-been published. Appending a notification command after `--background` would
-only report that the supervisor started, not that the review finished.
+Notifications run inside the foreground supervisor after a terminal manifest
+has been published. Do not append a separate notification command to the runner
+invocation; the long-lived supervisor sends the completion notification itself.
 
 | Mode | Behavior |
 | --- | --- |
@@ -351,8 +365,6 @@ Each run receives a unique UTC timestamp, process ID, and random suffix:
     ├── <run-id>-01-kimi-k3.stderr.log
     ├── <run-id>-02-grok-4-5.stderr.log
     ├── <run-id>-03-fable-5.stderr.log
-    ├── <run-id>-runner.stdout.log
-    ├── <run-id>-runner.stderr.log
     ├── <run-id>-runner.pid
     └── <run-id>-manifest.json
 ```
@@ -414,8 +426,9 @@ Monjuは、同じ対象を3つのCursor CLIモデルへ渡し、相互に独立�
 モデルID、読み取り専用モード、共通プロンプト、3並列実行、保存ファイル名はランナー
 側で固定されます。
 
-レビューには通常数分以上かかります。Codexはバックグラウンドの監督プロセスを
-起動したらすぐにターンを終了し、別の会話ターンで結果を確認・集約します。
+レビューには通常数分以上かかります。Codexは管理対象background terminalの
+前景で監督プロセスを動かし、ポーリングせずに起動ターンを終了します。別の
+会話ターンで結果を確認・集約します。
 
 主な用途は次のとおりです。
 
@@ -582,16 +595,22 @@ $monjuを使って、この設計文書をレビューしてください。
 曖昧な要件を特定し、重要な不確実性を解消できる実験も提案してください。
 ```
 
-Codexは一意な実行フォルダ内にタスク専用のレビュー指示を作成し、Monjuを
-バックグラウンド起動します。そのターンでは待機もポーリングも行いません。
-別のターンで保存済み実行の確認を依頼すると、3件の結果を読み、重要な指摘を
-元資料で検証したうえで、合意点、単独の有用な指摘、意見の相違、未実行の
-実験案をまとめます。
+Codexは一意な実行フォルダ内にタスク専用のレビュー指示を作成し、Codex
+background terminalの前景コマンドとしてMonjuを実行します。そのターンでは
+待機もポーリングも行いません。別のターンで保存済み実行の確認を依頼すると、
+3件の結果を読み、重要な指摘を元資料で検証したうえで、合意点、単独の有用な
+指摘、意見の相違、未実行の実験案をまとめます。
+
+Monjuの呼び出し自体を、対象範囲の読み取り専用レビュー、preflight、成果物の
+作成、必要な場合の対象workspace限定のtrust登録に対する許可として扱います。
+Codexは実行前に会話であらためて確認しません。sandbox外実行が必要な場合は、
+対象コマンドを直接ツールへ送信し、実行基盤が必要に応じて承認ポップアップを
+表示します。認証やSSOなど、ユーザー本人の操作が本当に必要な場合だけ停止します。
 
 ### ランナーの直接実行
 
-通常はCodexが自動的に実行します。手動で非同期実行する場合は、最初にpreflight
-を実行します。
+通常はCodexが自動的に実行します。Codexの非同期ワークフローでは、最初に
+preflightを実行します。
 
 ```bash
 AGENT_CLI_CREDENTIAL_STORE=file \
@@ -604,8 +623,8 @@ preflightは、該当する`~/.cursor/projects`内で一時ファイルを作成
 書き込み可否を確認し、workspace固有のtrust markerとファイル認証を検証します。
 `PREFLIGHT=cursor_state_unwritable`の場合は、preflightと起動の両方をfilesystem
 sandbox外で再実行してください。`PREFLIGHT=workspace_trust_required`の場合は、
-Codexが対象workspaceを明記した限定的な実行承認を要求し、次のコマンドをPTY付きで
-sandbox外実行します。
+Codexが対象workspaceを明記した限定的な実行承認をツールから直接要求し、次の
+コマンドをPTY付きでsandbox外実行します。
 
 ```bash
 AGENT_CLI_CREDENTIAL_STORE=file \
@@ -614,7 +633,9 @@ agent --workspace "/absolute/path/to/workspace" --trust
 
 ユーザーがターミナルを開く必要はありません。Cursor Agentが最初のプロンプトまで
 到達したら、Codexはプロンプトを送信せずにプロセスを終了し、preflightを再実行
-します。承認理由には、永続的にtrust登録するworkspaceの絶対パスを明記します。
+します。プラットフォームの承認要求を送る前に、会話上の確認は挟みません。Monjuの
+呼び出し時点で、そのworkspaceに限定したtrust登録は許可済みとして扱います。
+承認理由には、永続的にtrust登録するworkspaceの絶対パスを明記します。
 `--yolo`や`--force`、広範な再利用可能承認、trust markerの直接編集は使いません。
 
 `PREFLIGHT=ok`の後に実行フォルダを確保します。
@@ -626,23 +647,23 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
   --output-root "/absolute/path/to/output"
 ```
 
-表示された`PROMPT_FILE`へレビュー指示を書き、バックグラウンド起動します。
+表示された`PROMPT_FILE`へレビュー指示を書き、Codex unified exec sessionを
+1つ使って、短い初回yield付きで次のコマンドを起動します。
 
 ```bash
 AGENT_CLI_CREDENTIAL_STORE=file \
 uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --background \
   --notify auto \
   --workspace "/absolute/path/to/workspace" \
   --run-dir "/RUN_DIRで表示された絶対パス" \
   --prompt-file "/PROMPT_FILEで表示された絶対パス"
 ```
 
-ランチャーは短いstartup猶予時間だけ待ちます。`STARTUP=confirmed`は、3モデル
-すべての検証済み初期化イベントを確認したことを示します。`STARTUP=pending`は
-監督プロセスが動作中でも初期化確認が間に合わなかった状態です。終端`STATUS`と
-`STARTUP=failed`が返った場合は即時失敗であり、正常なバックグラウンド起動
-として扱いません。
+runner自体をexec sessionの前景に置きます。約3秒後にツールが生存中のsession
+IDを返したら、Codexはポーリングせずターンを終了できます。管理対象background
+terminalが引き続き監督プロセスを所有します。`&`、`nohup`、`setsid`、
+`--background`は使いません。人が直接実行する場合は、レビュー完了までその
+ターミナルコマンドを動かしておく必要があります。
 
 後から、待機せず状態を確認します。
 
@@ -653,14 +674,17 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 ```
 
 マニフェストが`running`のまま監督プロセスだけ終了している場合、`--status`は
-`stale_running`を表示します。
+`stale_running`に加え、`STALE_REASON`、レビュワーごとの進捗数、保存済みstaging
+パスを表示します。initまたはfinalイベントがあれば実処理後の外部終了、
+初期化がなく意味のあるstderrだけがあれば起動失敗と分類します。既知の
+`LC_ALL=C.UTF-8` locale警告はこの分類では無視します。
 
 ランナーのオプション:
 
 ```text
 --preflight             Cursor状態領域、workspace trust、認証を確認
 --prepare               一意な実行フォルダと空のbriefを作成
---background            監督プロセスを切り離して即座に戻る
+--background            拒否。Codex background terminalの前景で実行
 --status                待機せず現在の状態を表示
 --run-dir PATH          準備済み実行フォルダ
 --agent-bin PATH        Cursor CLI実行ファイル。既定値: agent
@@ -675,9 +699,9 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 
 ### 完了通知
 
-通知は、切り離された監督プロセスの中で終端マニフェストを公開した後に実行
-されます。`--background`コマンドの後ろへ通知コマンドをつなぐと、レビュー完了
-ではなく監督プロセスの起動直後に通知されるため使用しません。
+通知は、前景の監督プロセスが終端マニフェストを公開した後に実行します。
+runnerコマンドの後ろへ別の通知コマンドをつなげず、長寿命の監督プロセス自身に
+完了通知を送らせます。
 
 | モード | 動作 |
 | --- | --- |
@@ -732,8 +756,6 @@ export MONJU_NOTIFY_WEBHOOK_URL="https://notification-service.example/hook"
     ├── <run-id>-01-kimi-k3.stderr.log
     ├── <run-id>-02-grok-4-5.stderr.log
     ├── <run-id>-03-fable-5.stderr.log
-    ├── <run-id>-runner.stdout.log
-    ├── <run-id>-runner.stderr.log
     ├── <run-id>-runner.pid
     └── <run-id>-manifest.json
 ```

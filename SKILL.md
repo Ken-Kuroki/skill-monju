@@ -1,13 +1,28 @@
 ---
 name: monju
-description: Launch three independent, parallel, read-only Cursor CLI reviews asynchronously with the highest non-Fast reasoning variants of Kimi K3, Grok 4.5, and Claude Fable 5, then collect and verify their results in a later conversation turn. Require structured but unexecuted experiment proposals and save private, collision-free review artifacts. Use for multi-model review, second opinions, plan review, implementation or code review, document or design review, and risk analysis.
+description: Launch three independent, parallel, read-only Cursor CLI reviews asynchronously in a Codex background terminal with the highest non-Fast reasoning variants of Kimi K3, Grok 4.5, and Claude Fable 5, then collect and verify their results in a later conversation turn. Require structured but unexecuted experiment proposals and save private, collision-free review artifacts. Use for multi-model review, second opinions, plan review, implementation or code review, document or design review, and risk analysis.
 ---
 
 # Monju
 
 Generate one neutral review brief and give the same effective prompt to three fixed
-Cursor models. Launch the review in the background; never wait for completion in
-the launch turn. Inspect and aggregate results only in a later conversation turn.
+Cursor models. Keep the foreground supervisor alive in a Codex background terminal;
+never wait for completion in the launch turn. Inspect and aggregate results only in
+a later conversation turn.
+
+## Authorization semantics
+
+Treat an explicit invocation of this skill as authorization to run the scoped
+read-only review, perform its preflight, create private review artifacts, and,
+when required, register Cursor Workspace Trust for the exact requested workspace
+with `--trust`. Never ask for a conversational confirmation such as "Should I
+proceed?" before taking those actions.
+
+If filesystem sandbox escalation is required, submit the tool call immediately
+with a precise platform approval request. Let the platform approval UI handle
+that decision; do not precede it with a chat question or consume a separate turn.
+Stop only when the user must actually provide missing information or complete an
+action, such as browser authentication or SSO.
 
 ## Launch turn
 
@@ -25,13 +40,17 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
    ```
 
 4. Handle preflight failures without weakening Cursor protections:
-   - For `PREFLIGHT=cursor_state_unwritable`, request platform approval to rerun
-     the preflight outside the filesystem sandbox. Use the same outside-sandbox
-     execution for the eventual `--background` launch. Do not wait for Cursor to
-     fail with `EPERM` under `~/.cursor/projects`.
+   - For `PREFLIGHT=cursor_state_unwritable`, immediately submit an escalated
+     tool call to rerun the preflight outside the filesystem sandbox. Do not ask
+     for permission in chat first; the platform approval UI is the approval
+     step. Use the same outside-sandbox execution for the eventual foreground
+     launch. Do not wait for Cursor to fail with `EPERM` under
+     `~/.cursor/projects`.
    - For `PREFLIGHT=workspace_trust_required`, do not ask the user to open a
-     terminal. Request narrowly scoped platform approval to run this exact
-     command outside the filesystem sandbox with a PTY:
+     terminal or ask for conversational confirmation. The skill invocation
+     authorizes trust registration for this exact workspace. Immediately submit
+     a narrowly scoped platform approval request to run this exact command
+     outside the filesystem sandbox with a PTY:
 
      ```bash
      AGENT_CLI_CREDENTIAL_STORE=file \
@@ -71,33 +90,34 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
    enterprise-scale, safety-critical, or speculative future requirements.
    Exclude `monju-reviews/` and the current run's generated artifacts from the
    reviewers' inspection scope.
-7. Start the run using the `RUN_DIR` and `PROMPT_FILE` from step 5. If step 4
-   required outside-sandbox execution, request or reuse that approval here:
+7. Start the run using one Codex unified `exec_command` session with a short
+   initial yield. Keep the runner itself in that session's foreground. If step 4
+   required outside-sandbox execution, directly request or reuse the platform
+   approval on this tool call without asking in chat first:
 
    ```bash
    AGENT_CLI_CREDENTIAL_STORE=file \
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
-     --background \
      --notify auto \
      --workspace "<absolute-workspace>" \
      --run-dir "<absolute-run-dir>" \
      --prompt-file "<absolute-prompt-file>"
    ```
 
-8. Do not ask for an extra review confirmation. Invoking this skill authorizes
-   the read-only review and creation of generated artifacts under the output
-   directory; still respect any platform-enforced approval.
-9. Interpret the short startup result, then end the turn:
-   - `STATUS=running` with `STARTUP=confirmed` means all three reviewers emitted
-     verified model initialization events.
-   - `STATUS=running` with `STARTUP=pending` means the supervisor is alive but
-     initialization was not confirmed within the short grace period; report that
-     distinction without polling.
-   - A terminal `STATUS` with `STARTUP=failed` is an immediate launch failure, not
-     a successful background start. Report it and the saved run directory.
-
-   Never wait for review completion, read intermediate streams, or start another
-   run in the launch turn.
+   Set `yield_time_ms` to about 3000 so immediate failures can finish visibly.
+   A still-running tool result must return a live exec session ID; that Codex
+   background terminal, not a detached Python subprocess, owns the supervisor
+   until completion. Do not append `&`, use `nohup` or `setsid`, pass
+   `--background`, or send the supervisor into another process tree. If unified
+   exec cannot retain a live session, stop instead of using a detach fallback.
+8. Do not ask for an extra review confirmation at any point in this workflow.
+   A platform-enforced approval popup is expected when escalation is necessary,
+   but it must not be preceded by a conversational yes/no question.
+9. If the command yields with a live exec session and prints `STATUS=running` plus
+   `EXECUTION_MODE=foreground_supervisor`, report the saved run directory and
+   end the turn. Do not call `write_stdin`, poll the session, read intermediate
+   streams, or start another run. If the command exits during the initial yield,
+   report its terminal status as an immediate launch result instead.
 
 ## Result-check turn
 
@@ -110,8 +130,19 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
    ```
 
 2. If status is `prepared` or `running`, report it and stop. Do not block or poll.
-   If status is `stale_running`, inspect the runner stderr log, report that the
-   detached supervisor exited without a terminal manifest, and do not auto-retry.
+   For `stale_running`, use `STALE_REASON`, `STALE_PROGRESS`, and
+   `STAGING_PRESERVED` from the status output:
+   - `external_termination_after_startup` or
+     `external_termination_after_results` means reviewers made verified progress
+     before the supervisor was externally killed; do not call this a startup
+     failure.
+   - `startup_failure` means no reviewer initialized and meaningful startup
+     diagnostics were recorded.
+   - `external_termination_before_startup` means the supervisor disappeared
+     before useful reviewer evidence was written.
+
+   Inspect preserved event and stderr files only for this stale diagnosis, report
+   the distinction, and do not auto-retry.
 3. For a terminal manifest status, read the manifest and the three generated review
    `*.md` files. Treat `*.events.jsonl` and stderr logs as diagnostics only.
 4. Report:
@@ -176,6 +207,10 @@ model is unavailable, preserve that failure without substitution.
   maximum theoretical robustness.
 - Verify the `system/init` model against the normalized allowlist of observed
   maximum-quality model IDs and display names. Fail visibly on any unknown name.
+- Keep the supervisor in the foreground of a Codex unified-exec background
+  terminal. Never rely on `start_new_session`, `nohup`, `setsid`, or a detached
+  Python child to outlive the launch turn. Treat the live exec session ID as the
+  launch-lifetime guarantee and do not poll it.
 - Before launch, probe actual write access to the relevant Cursor project state
   directory, verify the workspace-specific trust marker, and check file-store
   authentication. On an untrusted workspace, let Codex run Cursor's dedicated
@@ -212,7 +247,7 @@ model is unavailable, preserve that failure without substitution.
 ```text
 --preflight             Check Cursor state access, workspace trust, and authentication
 --prepare               Create a unique run directory and empty brief
---background            Start the detached supervisor and return immediately
+--background            Rejected; use a foreground Codex background terminal
 --status                Read run status without waiting
 --run-dir PATH          Prepared run directory
 --agent-bin PATH        Cursor CLI executable; default: agent
