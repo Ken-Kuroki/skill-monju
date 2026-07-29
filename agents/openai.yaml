@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monju"
+  short_description: "Launch three max-effort reviews with completion alerts"
+  default_prompt: "Use $monju to launch three read-only reviews in the background, notify me when they finish, and collect their results in a later turn."
