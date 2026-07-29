@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -10,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import run_monju
@@ -172,6 +175,135 @@ class RunnerTestCase(unittest.TestCase):
             Path(self.parse_key(result.stdout, "PROMPT_FILE")),
         )
 
+    def make_recovery_run(
+        self,
+        root: Path,
+        *,
+        terminal_states: dict[str, str] | None = None,
+        reported_models: dict[str, str] | None = None,
+        supervisor_pid: int = 2_147_483_647,
+    ) -> tuple[Path, Path]:
+        run_id = f"monju-recovery-{time.time_ns()}"
+        run_dir = root / run_id
+        workspace = root / f"{run_id}-workspace"
+        staging_parent = root / f"{run_id}-staging-test"
+        staging_dir = staging_parent / run_id
+        run_dir.mkdir()
+        workspace.mkdir()
+        staging_dir.mkdir(parents=True)
+        prompt = run_dir / f"{run_id}-00-review-brief.md"
+        prompt.write_text("# Review\nInspect preserved results.", encoding="utf-8")
+        review_brief, effective_prompt = run_monju.read_review_brief(prompt)
+        run_monju.copy_prompt_artifacts(
+            staging_dir,
+            run_id,
+            review_brief,
+            effective_prompt,
+        )
+        prompt_hash = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
+        manifest = {
+            "schema_version": 2,
+            "run_id": run_id,
+            "status": "running",
+            "started_at": "2026-07-29T13:14:53.695+00:00",
+            "completed_at": None,
+            "workspace": str(workspace),
+            "source_prompt_file": str(prompt),
+            "effective_prompt_sha256": prompt_hash,
+            "reasoning_policy": run_monju.REASONING_POLICY,
+            "parallel_reviewer_count": len(run_monju.REVIEWERS),
+            "execution_mode": run_monju.EXECUTION_MODE,
+            "supervisor_pid": supervisor_pid,
+            "notification": run_monju.notification_pending("none"),
+            "results": [],
+        }
+        run_monju.write_json_atomic(
+            run_dir / f"{run_id}-manifest.json",
+            manifest,
+        )
+        run_monju.atomic_write_text(
+            run_dir / f"{run_id}-runner.pid",
+            f"{supervisor_pid}\n",
+        )
+        run_monju.atomic_write_text(
+            run_dir / f".{run_id}-staging",
+            f"{staging_dir}\n",
+        )
+
+        states = terminal_states or {}
+        model_overrides = reported_models or {}
+        for reviewer in run_monju.REVIEWERS:
+            state = states.get(reviewer.key, "success")
+            events, stderr, _ = run_monju.reviewer_artifact_paths(
+                staging_dir,
+                run_id,
+                reviewer,
+            )
+            lines = [
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "model": model_overrides.get(
+                            reviewer.key,
+                            reviewer.allowed_reported_models[-1],
+                        ),
+                        "session_id": f"session-{reviewer.key}",
+                    }
+                )
+            ]
+            if state == "success":
+                lines.append(
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": False,
+                            "duration_ms": 1234,
+                            "result": REVIEW_TEXT,
+                        }
+                    )
+                )
+            elif state == "cursor_error":
+                lines.append(
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "error",
+                            "is_error": True,
+                            "duration_ms": 1234,
+                            "result": "simulated Cursor error",
+                        }
+                    )
+                )
+            elif state == "malformed":
+                lines.extend(
+                    [
+                        "{malformed",
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": False,
+                                "result": REVIEW_TEXT,
+                            }
+                        ),
+                    ]
+                )
+            elif state != "incomplete":
+                raise AssertionError(f"unsupported terminal state: {state}")
+            events.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            stderr.write_text("", encoding="utf-8")
+        return run_dir, staging_dir
+
+    @staticmethod
+    def recovery_args(
+        run_dir: Path,
+        *,
+        notify: str = "none",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(run_dir=run_dir, notify=notify)
+
     def wait_for_terminal_manifest(self, run_dir: Path, timeout: float = 8) -> dict:
         manifest = run_dir / f"{run_dir.name}-manifest.json"
         deadline = time.monotonic() + timeout
@@ -218,7 +350,7 @@ class RunnerTestCase(unittest.TestCase):
         self.assertIn("purely stylistic preferences", prompt)
         self.assertIn("expected decision value", prompt)
 
-    def test_valid_result_survives_non_json_noise(self) -> None:
+    def test_parser_retains_diagnostics_but_rejects_non_json_noise(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             events = Path(temporary) / "events.jsonl"
             events.write_text(
@@ -252,6 +384,126 @@ class RunnerTestCase(unittest.TestCase):
             self.assertEqual(final, REVIEW_TEXT)
             self.assertIsNone(error)
             self.assertEqual(len(warnings), 1)
+            parsed = run_monju.inspect_event_stream(events)
+            self.assertTrue(parsed.malformed_lines)
+            self.assertTrue(
+                any(
+                    "malformed Cursor event stream" in item
+                    for item in run_monju.parsed_review_errors(
+                        run_monju.REVIEWERS[0],
+                        parsed,
+                    )
+                )
+            )
+
+    def test_heartbeat_flushes_safe_liveness_output_at_interval(self) -> None:
+        class FlushRecorder(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.flush_count = 0
+
+            def flush(self) -> None:
+                self.flush_count += 1
+                super().flush()
+
+        output = FlushRecorder()
+        heartbeat = run_monju.SupervisorHeartbeat(
+            "monju-heartbeat-test",
+            interval_seconds=0.01,
+            output=output,
+        )
+        with heartbeat:
+            time.sleep(0.035)
+
+        lines = output.getvalue().splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertGreaterEqual(output.flush_count, len(lines))
+        self.assertTrue(
+            all(
+                line.startswith(
+                    "MONJU_HEARTBEAT run_id=monju-heartbeat-test "
+                    "elapsed_seconds="
+                )
+                for line in lines
+            )
+        )
+        self.assertNotIn("private prompt", output.getvalue())
+        self.assertNotIn("/secret/workspace", output.getvalue())
+        self.assertNotIn("webhook-token", output.getvalue())
+
+    def test_heartbeat_thread_stops_after_normal_completion(self) -> None:
+        heartbeat = run_monju.SupervisorHeartbeat(
+            "monju-normal-stop",
+            interval_seconds=0.01,
+            output=io.StringIO(),
+        )
+        self.assertFalse(heartbeat.daemon)
+        with heartbeat:
+            self.assertTrue(heartbeat.is_alive)
+        self.assertFalse(heartbeat.is_alive)
+
+    def test_foreground_supervisor_uses_and_stops_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            run_dir = root / "monju-heartbeat-integration"
+            workspace.mkdir()
+            run_dir.mkdir()
+            fake = self.make_fake_agent(root)
+            prompt = run_dir / f"{run_dir.name}-00-review-brief.md"
+            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
+            review_brief, effective_prompt = run_monju.read_review_brief(prompt)
+            stdout = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    run_monju,
+                    "HEARTBEAT_INTERVAL_SECONDS",
+                    0.01,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"FAKE_AGENT_SLEEP": "0.05"},
+                    clear=False,
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = run_monju.execute_reviews(
+                    workspace=workspace,
+                    prompt_file=prompt,
+                    run_dir=run_dir,
+                    run_id=run_dir.name,
+                    agent_bin=str(fake),
+                    timeout_seconds=5,
+                    review_brief=review_brief,
+                    effective_prompt=effective_prompt,
+                    run_started_at=run_monju.iso_now(),
+                    notification_mode="none",
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn(
+                "MONJU_HEARTBEAT "
+                "run_id=monju-heartbeat-integration elapsed_seconds=",
+                stdout.getvalue(),
+            )
+            self.assertFalse(
+                any(
+                    thread.name == "monju-heartbeat-monju-heartbeat-integration"
+                    for thread in threading.enumerate()
+                )
+            )
+
+    def test_heartbeat_thread_stops_after_sigterm_equivalent_exception(self) -> None:
+        heartbeat = run_monju.SupervisorHeartbeat(
+            "monju-signal-stop",
+            interval_seconds=0.01,
+            output=io.StringIO(),
+        )
+        with self.assertRaises(run_monju.RunInterrupted):
+            with heartbeat:
+                raise run_monju.RunInterrupted(signal.SIGTERM)
+        self.assertFalse(heartbeat.is_alive)
 
     def test_foreground_run_publishes_three_reviews(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -970,6 +1222,355 @@ class RunnerTestCase(unittest.TestCase):
             self.assertIn("STALE_REASON=startup_failure", status.stdout)
             self.assertIn("initialized:0/3", status.stdout)
             self.assertIn("startup_errors:3/3", status.stdout)
+
+    def test_recover_refuses_a_live_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(
+                Path(temporary),
+                supervisor_pid=os.getpid(),
+            )
+            before = (
+                run_dir / f"{run_dir.name}-manifest.json"
+            ).read_bytes()
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+
+            self.assertEqual(exit_code, 65)
+            self.assertIn("STATUS=recovery_refused", stdout.getvalue())
+            self.assertIn(
+                "RECOVERY_REASON=recorded supervisor PID is still running",
+                stdout.getvalue(),
+            )
+            self.assertEqual(
+                (run_dir / f"{run_dir.name}-manifest.json").read_bytes(),
+                before,
+            )
+            self.assertTrue(staging.is_dir())
+
+    def test_recover_requires_preserved_staging_pointer_and_directory(self) -> None:
+        for missing in ("pointer", "directory"):
+            with self.subTest(missing=missing):
+                with tempfile.TemporaryDirectory() as temporary:
+                    run_dir, staging = self.make_recovery_run(Path(temporary))
+                    manifest = run_dir / f"{run_dir.name}-manifest.json"
+                    before = manifest.read_bytes()
+                    if missing == "pointer":
+                        (run_dir / f".{run_dir.name}-staging").unlink()
+                    else:
+                        shutil.rmtree(staging.parent)
+                    stdout = io.StringIO()
+
+                    with contextlib.redirect_stdout(stdout):
+                        exit_code = run_monju.recover_review(
+                            self.recovery_args(run_dir)
+                        )
+
+                    self.assertEqual(exit_code, 65)
+                    self.assertIn("STATUS=recovery_invalid", stdout.getvalue())
+                    self.assertIn("RECOVERY=invalid", stdout.getvalue())
+                    self.assertEqual(manifest.read_bytes(), before)
+
+    def test_recover_is_non_destructive_when_terminal_event_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(
+                Path(temporary),
+                terminal_states={"fable-5": "incomplete"},
+            )
+            manifest = run_dir / f"{run_dir.name}-manifest.json"
+            before_manifest = manifest.read_bytes()
+            before_run_files = sorted(path.name for path in run_dir.iterdir())
+            before_staging = {
+                path.name: path.read_bytes()
+                for path in staging.iterdir()
+                if path.is_file()
+            }
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+
+            self.assertEqual(exit_code, 75)
+            self.assertIn("STATUS=recovery_not_ready", stdout.getvalue())
+            self.assertIn("RECOVERY=not_ready", stdout.getvalue())
+            self.assertEqual(manifest.read_bytes(), before_manifest)
+            self.assertEqual(
+                sorted(path.name for path in run_dir.iterdir()),
+                before_run_files,
+            )
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in staging.iterdir()
+                    if path.is_file()
+                },
+                before_staging,
+            )
+
+    def test_recover_publishes_three_verified_successes_without_external_calls(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(run_monju.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    run_monju.urllib.request,
+                    "urlopen",
+                ) as urlopen,
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+
+            self.assertEqual(exit_code, 0)
+            popen.assert_not_called()
+            urlopen.assert_not_called()
+            self.assertFalse(staging.parent.exists())
+            self.assertFalse(
+                (run_dir / f".{run_dir.name}-staging").exists()
+            )
+            markdown = list(run_dir.glob(f"{run_dir.name}-0[1-3]-*.md"))
+            self.assertEqual(len(markdown), 3)
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "success")
+            self.assertTrue(manifest["recovered"])
+            self.assertEqual(
+                manifest["recovery_source"],
+                run_monju.RECOVERY_SOURCE,
+            )
+            self.assertEqual(manifest["review_completed_at"], None)
+            self.assertEqual(manifest["notification"]["status"], "disabled")
+            self.assertTrue(
+                all(
+                    result["recovered"]
+                    and result["model_verified"]
+                    and result["status"] == "success"
+                    and result["recovery_validation"]["errors"] == []
+                    for result in manifest["results"]
+                )
+            )
+
+    def test_recover_publishes_cursor_error_as_partial_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, _ = self.make_recovery_run(
+                Path(temporary),
+                terminal_states={"grok-4-5": "cursor_error"},
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+
+            self.assertEqual(exit_code, 3)
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "partial_failure")
+            grok = next(
+                item
+                for item in manifest["results"]
+                if item["reviewer"] == "Grok 4.5"
+            )
+            self.assertEqual(grok["status"], "failed")
+            self.assertIn("simulated Cursor error", grok["error"])
+
+    def test_recover_never_accepts_unknown_or_forbidden_models(self) -> None:
+        cases = ("Unknown Reviewer 9 Max", "Kimi K3 Fast Max")
+        for reported_model in cases:
+            with self.subTest(reported_model=reported_model):
+                with tempfile.TemporaryDirectory() as temporary:
+                    run_dir, _ = self.make_recovery_run(
+                        Path(temporary),
+                        reported_models={"kimi-k3": reported_model},
+                    )
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        exit_code = run_monju.recover_review(
+                            self.recovery_args(run_dir)
+                        )
+                    manifest = json.loads(
+                        (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                self.assertEqual(exit_code, 3)
+                self.assertEqual(manifest["status"], "partial_failure")
+                kimi = next(
+                    item
+                    for item in manifest["results"]
+                    if item["reviewer"] == "Kimi K3"
+                )
+                self.assertEqual(kimi["status"], "failed")
+                self.assertFalse(kimi["model_verified"])
+
+    def test_recover_never_accepts_a_malformed_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, _ = self.make_recovery_run(
+                Path(temporary),
+                terminal_states={"kimi-k3": "malformed"},
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(exit_code, 3)
+            self.assertEqual(manifest["status"], "partial_failure")
+            kimi = next(
+                item
+                for item in manifest["results"]
+                if item["reviewer"] == "Kimi K3"
+            )
+            self.assertEqual(kimi["status"], "failed")
+            self.assertIn("malformed Cursor event stream", kimi["error"])
+
+    def test_recover_is_idempotent_after_terminal_manifest_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, _ = self.make_recovery_run(Path(temporary))
+            args = self.recovery_args(run_dir)
+            with contextlib.redirect_stdout(io.StringIO()):
+                first_exit = run_monju.recover_review(args)
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            first_manifest = manifest_path.read_bytes()
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                second_exit = run_monju.recover_review(args)
+
+            self.assertEqual(first_exit, 0)
+            self.assertEqual(second_exit, 0)
+            self.assertEqual(manifest_path.read_bytes(), first_manifest)
+            self.assertIn("STATUS=success", stdout.getvalue())
+            self.assertIn("RECOVERY=published", stdout.getvalue())
+
+    def test_recover_publish_failure_preserves_raw_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    run_monju,
+                    "publish_staging",
+                    side_effect=PermissionError("simulated recovery publish failure"),
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir)
+                )
+
+            self.assertEqual(exit_code, 74)
+            self.assertTrue(staging.is_dir())
+            self.assertTrue(
+                (run_dir / f".{run_dir.name}-staging").is_file()
+            )
+            self.assertIn(
+                f"STAGING_PRESERVED={staging.resolve()}",
+                stdout.getvalue(),
+            )
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "artifact_failure")
+            self.assertTrue(manifest["recovered"])
+
+    def test_recover_notification_failure_does_not_change_review_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, _ = self.make_recovery_run(Path(temporary))
+            with (
+                mock.patch.object(
+                    run_monju,
+                    "run_desktop_notification",
+                    side_effect=RuntimeError("desktop unavailable"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = run_monju.recover_review(
+                    self.recovery_args(run_dir, notify="desktop")
+                )
+
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(manifest["status"], "success")
+            self.assertEqual(manifest["notification"]["status"], "failed")
+            self.assertEqual(manifest["notification"]["backend"], "desktop")
+
+    def test_recover_rejects_network_notification_modes_before_writing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            manifest = run_dir / f"{run_dir.name}-manifest.json"
+            before = manifest.read_bytes()
+
+            with self.assertRaises(SystemExit):
+                run_monju.recover_review(
+                    self.recovery_args(run_dir, notify="webhook")
+                )
+
+            self.assertEqual(manifest.read_bytes(), before)
+            self.assertTrue(staging.is_dir())
+
+    def test_status_reports_recovery_ready_not_ready_and_invalid(self) -> None:
+        cases = (
+            ({}, "ready", "3/3", "yes"),
+            ({"fable-5": "incomplete"}, "not_ready", "2/3", "no"),
+            ({"kimi-k3": "malformed"}, "invalid", "3/3", "yes"),
+        )
+        for states, expected, terminal_count, can_publish in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temporary:
+                    run_dir, _ = self.make_recovery_run(
+                        Path(temporary),
+                        terminal_states=states,
+                    )
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        exit_code = run_monju.read_status(
+                            self.recovery_args(run_dir)
+                        )
+                    output = stdout.getvalue()
+
+                self.assertEqual(exit_code, 0)
+                self.assertIn("STATUS=stale_running", output)
+                self.assertIn(f"RECOVERY={expected}", output)
+                self.assertIn(
+                    f"RECOVERY_TERMINAL_RESULTS={terminal_count}",
+                    output,
+                )
+                self.assertIn(
+                    f"RECOVERY_CAN_PUBLISH={can_publish}",
+                    output,
+                )
 
     def test_bad_agent_path_records_supervisor_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

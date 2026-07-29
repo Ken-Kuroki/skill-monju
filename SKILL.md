@@ -112,6 +112,11 @@ or complete an action, such as browser authentication or SSO.
    until completion. Do not append `&`, use `nohup` or `setsid`, pass
    `--background`, or send the supervisor into another process tree. If unified
    exec cannot retain a live session, stop instead of using a detach fallback.
+   While reviewers are active, the runner itself emits a short flushed
+   `MONJU_HEARTBEAT` line about every 30 seconds. This is internal supervisor
+   liveness output, not Codex polling, and contains no prompt, workspace, or
+   credential data. It may avoid an idle cleanup, but does not protect against
+   a hard exec-session TTL; the observed cleanup cause is not yet known.
 8. Do not ask for an extra review confirmation at any point in this workflow.
    A platform-enforced approval may surface to the user or go to Auto-review,
    but it must not be preceded by a conversational yes/no question.
@@ -186,8 +191,29 @@ denies the launch as private-data export to an untrusted external destination:
    - `external_termination_before_startup` means the supervisor disappeared
      before useful reviewer evidence was written.
 
-   Inspect preserved event and stderr files only for this stale diagnosis, report
-   the distinction, and do not auto-retry.
+   Also use `RECOVERY`, `RECOVERY_TERMINAL_RESULTS`, and
+   `RECOVERY_CAN_PUBLISH`:
+   - Only when all three terminal result events exist and
+     `RECOVERY_CAN_PUBLISH=yes`, run recovery once:
+
+     ```bash
+     uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
+       --recover \
+       --run-dir "<absolute-run-dir>"
+     ```
+
+     `RECOVERY=ready` means all three streams passed validation.
+     `RECOVERY=invalid` with `RECOVERY_CAN_PUBLISH=yes` means all terminal
+     events exist but at least one malformed stream, Cursor error, or model
+     verification failure will be published as a normal partial/failure result.
+   - For `RECOVERY=not_ready`, or `invalid` with
+     `RECOVERY_CAN_PUBLISH=no`, preserve raw staging and stop. Do not infer
+     missing results, automatically retry, or start replacement reviewers.
+
+   Recovery reads only preserved artifacts. It does not invoke Cursor, contact
+   an external LLM, or retry a reviewer. Inspect preserved event and stderr
+   files only for this stale diagnosis, report the distinction, and do not
+   auto-retry.
 3. For a terminal manifest status, read the manifest and the three generated review
    `*.md` files. Treat `*.events.jsonl` and stderr logs as diagnostics only.
 4. Report:
@@ -254,8 +280,14 @@ model is unavailable, preserve that failure without substitution.
   maximum-quality model IDs and display names. Fail visibly on any unknown name.
 - Keep the supervisor in the foreground of a Codex unified-exec background
   terminal. Never rely on `start_new_session`, `nohup`, `setsid`, or a detached
-  Python child to outlive the launch turn. Treat the live exec session ID as the
-  launch-lifetime guarantee and do not poll it.
+  Python child to outlive the launch turn. Treat the live exec session as the
+  process-ownership boundary, not a guarantee against idle cleanup or a hard
+  TTL, and do not poll it. The runner emits its own bounded heartbeat while
+  waiting and stops that heartbeat on completion, interruption, or failure.
+- Recover only a dead supervisor's preserved streams after all three terminal
+  result events exist. Refuse a live supervisor, never relaunch an external
+  reviewer, leave incomplete or unpublishable invalid raw staging intact, and
+  make repeated recovery against a published terminal manifest a no-op.
 - Before launch, probe actual write access to the relevant Cursor project state
   directory, verify the workspace-specific trust marker, and check file-store
   authentication. On an untrusted workspace, let Codex run Cursor's dedicated
@@ -294,6 +326,7 @@ model is unavailable, preserve that failure without substitution.
 --prepare               Create a unique run directory and empty brief
 --background            Rejected; use a foreground Codex background terminal
 --status                Read run status without waiting
+--recover               Validate and publish completed preserved event streams
 --run-dir PATH          Prepared run directory
 --agent-bin PATH        Cursor CLI executable; default: agent
 --timeout-seconds N     Per-reviewer timeout; default: 3600

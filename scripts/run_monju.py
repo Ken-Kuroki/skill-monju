@@ -150,6 +150,18 @@ PRIVATE_DIR_MODE = 0o700
 NOTIFICATION_WEBHOOK_ENV = "MONJU_NOTIFY_WEBHOOK_URL"
 NOTIFICATION_TIMEOUT_SECONDS = 10
 EXECUTION_MODE = "foreground_supervisor"
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+RECOVERY_SOURCE = "preserved_event_streams"
+TERMINAL_STATUSES = frozenset(
+    {
+        "success",
+        "partial_failure",
+        "failure",
+        "interrupted",
+        "artifact_failure",
+        "supervisor_failure",
+    }
+)
 IGNORED_STARTUP_STDERR_FRAGMENTS = (
     "warning: setlocale: LC_ALL: cannot change locale",
 )
@@ -163,17 +175,56 @@ class ReviewResult:
     model_verified: bool
     session_id: str | None
     status: str
-    exit_code: int
-    timed_out: bool
-    started_at: str
-    completed_at: str
-    duration_seconds: float
+    exit_code: int | None
+    timed_out: bool | None
+    started_at: str | None
+    completed_at: str | None
+    duration_seconds: float | None
     markdown_file: str
     events_file: str
     stderr_file: str
-    command: list[str]
+    command: list[str] | None
     error: str | None
     warnings: list[str] = field(default_factory=list)
+    recovered: bool = False
+    timing_source: dict[str, str | None] | None = None
+    recovery_validation: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ParsedEventStream:
+    reported_model: str | None
+    session_id: str | None
+    final_text: str | None
+    stream_error: str | None
+    warnings: tuple[str, ...]
+    malformed_lines: tuple[int, ...]
+    event_count: int
+    terminal_result_count: int
+    terminal_result_is_last: bool
+    terminal_duration_seconds: float | None
+
+
+@dataclass(frozen=True)
+class RecoveryStream:
+    reviewer: Reviewer
+    events_path: Path
+    stderr_path: Path
+    parsed: ParsedEventStream | None
+    terminal_complete: bool
+    validation_errors: tuple[str, ...]
+    read_error: str | None
+
+
+@dataclass(frozen=True)
+class RecoveryAssessment:
+    state: str
+    staging_dir: Path | None
+    streams: tuple[RecoveryStream, ...]
+    terminal_results: int
+    successful_results: int
+    can_publish: bool
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -214,6 +265,74 @@ class ProcessCoordinator:
             processes = list(self._processes.values())
         for proc in processes:
             terminate_process(proc)
+
+
+class SupervisorHeartbeat:
+    """Emit bounded liveness output while the foreground supervisor waits."""
+
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        interval_seconds: float | None = None,
+        output: Any = None,
+    ) -> None:
+        self.run_id = run_id
+        self.interval_seconds = (
+            HEARTBEAT_INTERVAL_SECONDS
+            if interval_seconds is None
+            else interval_seconds
+        )
+        if self.interval_seconds <= 0:
+            raise ValueError("heartbeat interval must be greater than zero")
+        self.output = sys.stdout if output is None else output
+        self._stop_event = threading.Event()
+        self._started_at: float | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"monju-heartbeat-{run_id}",
+            daemon=False,
+        )
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def daemon(self) -> bool:
+        return self._thread.daemon
+
+    def start(self) -> SupervisorHeartbeat:
+        self._started_at = time.monotonic()
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread.ident is not None:
+            self._thread.join()
+
+    def __enter__(self) -> SupervisorHeartbeat:
+        return self.start()
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            started_at = self._started_at
+            if started_at is None:
+                return
+            elapsed_seconds = max(0, int(time.monotonic() - started_at))
+            try:
+                print(
+                    f"MONJU_HEARTBEAT run_id={self.run_id} "
+                    f"elapsed_seconds={elapsed_seconds}",
+                    file=self.output,
+                    flush=True,
+                )
+            except (BrokenPipeError, OSError, ValueError):
+                return
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,6 +383,14 @@ def parse_args() -> argparse.Namespace:
         "--status",
         action="store_true",
         help="Print the current status of --run-dir without waiting.",
+    )
+    mode.add_argument(
+        "--recover",
+        action="store_true",
+        help=(
+            "Publish a dead supervisor's completed preserved event streams "
+            "without invoking Cursor or using the network."
+        ),
     )
     mode.add_argument(
         "--dry-run",
@@ -691,14 +818,17 @@ def terminate_process(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def parse_event_stream(
-    path: Path,
-) -> tuple[str | None, str | None, str | None, str | None, list[str]]:
+def inspect_event_stream(path: Path) -> ParsedEventStream:
     reported_model: str | None = None
     session_id: str | None = None
     final_text: str | None = None
     stream_error: str | None = None
     warnings: list[str] = []
+    malformed_lines: list[int] = []
+    event_count = 0
+    terminal_result_count = 0
+    last_event_was_terminal = False
+    terminal_duration_seconds: float | None = None
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -706,10 +836,21 @@ def parse_event_stream(
             if not stripped:
                 continue
             try:
-                event: dict[str, Any] = json.loads(stripped)
+                decoded = json.loads(stripped)
             except json.JSONDecodeError as exc:
-                warnings.append(f"ignored non-JSON event line {line_number}: {exc}")
+                warnings.append(f"non-JSON event line {line_number}: {exc}")
+                malformed_lines.append(line_number)
                 continue
+            if not isinstance(decoded, dict):
+                warnings.append(
+                    f"non-object event line {line_number}: "
+                    f"{type(decoded).__name__}"
+                )
+                malformed_lines.append(line_number)
+                continue
+            event: dict[str, Any] = decoded
+            event_count += 1
+            last_event_was_terminal = False
 
             if session_id is None and isinstance(event.get("session_id"), str):
                 session_id = event["session_id"]
@@ -722,16 +863,91 @@ def parse_event_stream(
                 reported_model = event["model"]
 
             if event.get("type") == "result":
-                if event.get("subtype") == "success" and isinstance(
+                terminal_result_count += 1
+                last_event_was_terminal = True
+                duration_ms = event.get("duration_ms")
+                if (
+                    isinstance(duration_ms, (int, float))
+                    and not isinstance(duration_ms, bool)
+                    and duration_ms >= 0
+                ):
+                    terminal_duration_seconds = duration_ms / 1000
+                if event.get("is_error"):
+                    stream_error = str(
+                        event.get("result") or "Cursor reported an error"
+                    )
+                elif event.get("subtype") == "success" and isinstance(
                     event.get("result"), str
                 ):
                     final_text = event["result"]
-                elif event.get("is_error"):
+                else:
                     stream_error = str(
                         event.get("result") or "Cursor reported an error"
                     )
 
-    return reported_model, session_id, final_text, stream_error, warnings
+    return ParsedEventStream(
+        reported_model=reported_model,
+        session_id=session_id,
+        final_text=final_text,
+        stream_error=stream_error,
+        warnings=tuple(warnings),
+        malformed_lines=tuple(malformed_lines),
+        event_count=event_count,
+        terminal_result_count=terminal_result_count,
+        terminal_result_is_last=(
+            terminal_result_count > 0 and last_event_was_terminal
+        ),
+        terminal_duration_seconds=terminal_duration_seconds,
+    )
+
+
+def parse_event_stream(
+    path: Path,
+) -> tuple[str | None, str | None, str | None, str | None, list[str]]:
+    parsed = inspect_event_stream(path)
+    return (
+        parsed.reported_model,
+        parsed.session_id,
+        parsed.final_text,
+        parsed.stream_error,
+        list(parsed.warnings),
+    )
+
+
+def parsed_review_errors(
+    reviewer: Reviewer,
+    parsed: ParsedEventStream,
+) -> list[str]:
+    errors: list[str] = []
+    if parsed.malformed_lines:
+        lines = ", ".join(str(line) for line in parsed.malformed_lines[:10])
+        suffix = "…" if len(parsed.malformed_lines) > 10 else ""
+        errors.append(f"malformed Cursor event stream at line(s) {lines}{suffix}")
+    if parsed.terminal_result_count == 0:
+        errors.append("Cursor emitted no terminal result event")
+    elif parsed.terminal_result_count != 1:
+        errors.append(
+            "Cursor emitted an unexpected number of terminal result events: "
+            f"{parsed.terminal_result_count}"
+        )
+    elif not parsed.terminal_result_is_last:
+        errors.append("Cursor emitted events after its terminal result")
+
+    reported_model = parsed.reported_model
+    if not reported_model:
+        errors.append("Cursor emitted no system/init model")
+    elif has_forbidden_variant(reported_model):
+        errors.append(f"reported a forbidden model variant: '{reported_model}'")
+    elif not model_matches(reviewer, reported_model):
+        errors.append(
+            f"reported model '{reported_model}' does not match the required "
+            f"family and quality for '{reviewer.display_name}'"
+        )
+    if not parsed.final_text:
+        errors.append("Cursor emitted no successful final result")
+    if parsed.stream_error:
+        errors.append(parsed.stream_error)
+    return errors
 
 
 def markdown_report(
@@ -740,6 +956,13 @@ def markdown_report(
     final_text: str | None,
     stderr_text: str,
 ) -> str:
+    started_at = result.started_at or "not available"
+    completed_at = result.completed_at or "not available"
+    duration = (
+        f"{result.duration_seconds:.3f}s"
+        if result.duration_seconds is not None
+        else "not available"
+    )
     lines = [
         f"# Monju review — {reviewer.display_name}",
         "",
@@ -748,9 +971,9 @@ def markdown_report(
         f"- Model verified: `{'yes' if result.model_verified else 'no'}`",
         f"- Status: `{result.status}`",
         f"- Session ID: `{result.session_id or 'not reported'}`",
-        f"- Started: `{result.started_at}`",
-        f"- Completed: `{result.completed_at}`",
-        f"- Duration: `{result.duration_seconds:.3f}s`",
+        f"- Started: `{started_at}`",
+        f"- Completed: `{completed_at}`",
+        f"- Duration: `{duration}`",
         "",
     ]
     if result.warnings:
@@ -836,14 +1059,8 @@ def run_reviewer(
 
     completed_at = iso_now()
     duration = time.monotonic() - started_monotonic
-    (
-        reported_model,
-        session_id,
-        final_text,
-        stream_error,
-        warnings,
-    ) = parse_event_stream(events_path)
-    verified = model_matches(reviewer, reported_model)
+    parsed = inspect_event_stream(events_path)
+    verified = model_matches(reviewer, parsed.reported_model)
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
 
     error_parts: list[str] = []
@@ -853,27 +1070,15 @@ def run_reviewer(
         error_parts.append(f"review timed out after {timeout_seconds} seconds")
     if exit_code != 0:
         error_parts.append(f"Cursor CLI exited with status {exit_code}")
-    if not reported_model:
-        error_parts.append("Cursor emitted no system/init model")
-    elif has_forbidden_variant(reported_model):
-        error_parts.append(f"reported a forbidden model variant: '{reported_model}'")
-    elif not verified:
-        error_parts.append(
-            f"reported model '{reported_model}' does not match the required "
-            f"family and quality for '{reviewer.display_name}'"
-        )
-    if not final_text:
-        error_parts.append("Cursor emitted no successful final result")
-    if stream_error:
-        error_parts.append(stream_error)
+    error_parts.extend(parsed_review_errors(reviewer, parsed))
 
     status = "success" if not error_parts else "failed"
     result = ReviewResult(
         reviewer=reviewer.display_name,
         requested_model=reviewer.model_id,
-        reported_model=reported_model,
+        reported_model=parsed.reported_model,
         model_verified=verified,
-        session_id=session_id,
+        session_id=parsed.session_id,
         status=status,
         exit_code=exit_code,
         timed_out=timed_out,
@@ -885,10 +1090,10 @@ def run_reviewer(
         stderr_file=stderr_path.name,
         command=command[:-1] + ["<effective-prompt>"],
         error="; ".join(error_parts) if error_parts else None,
-        warnings=warnings,
+        warnings=list(parsed.warnings),
     )
     markdown_path.write_text(
-        markdown_report(reviewer, result, final_text, stderr_text),
+        markdown_report(reviewer, result, parsed.final_text, stderr_text),
         encoding="utf-8",
     )
     return result
@@ -1013,9 +1218,13 @@ def write_final_manifest(
     prompt_file: Path,
     effective_prompt: str,
     results: list[ReviewResult],
-    started_at: str,
+    started_at: str | None,
     interrupted_signal: int | None,
     notification_mode: str,
+    *,
+    supervisor_pid: int | None = None,
+    completed_at: str | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> str:
     status = classify_status(results, interrupted_signal is not None)
     payload = {
@@ -1023,7 +1232,7 @@ def write_final_manifest(
         "run_id": run_id,
         "status": status,
         "started_at": started_at,
-        "completed_at": iso_now(),
+        "completed_at": completed_at or iso_now(),
         "workspace": str(workspace),
         "source_prompt_file": str(prompt_file),
         "effective_prompt_sha256": hashlib.sha256(
@@ -1032,11 +1241,13 @@ def write_final_manifest(
         "reasoning_policy": REASONING_POLICY,
         "parallel_reviewer_count": len(REVIEWERS),
         "execution_mode": EXECUTION_MODE,
-        "supervisor_pid": os.getpid(),
+        "supervisor_pid": os.getpid() if supervisor_pid is None else supervisor_pid,
         "interrupted_signal": interrupted_signal,
         "notification": notification_pending(notification_mode),
         "results": [asdict(result) for result in results],
     }
+    if extra_fields:
+        payload.update(extra_fields)
     write_json_atomic(staging_dir / f"{run_id}-manifest.json", payload)
     return status
 
@@ -1290,6 +1501,37 @@ def publish_staging(staging_dir: Path, run_dir: Path) -> None:
         os.replace(temporary, destination)
 
 
+def cleanup_published_staging(
+    staging_parent: Path,
+    staging_pointer: Path,
+) -> None:
+    try:
+        shutil.rmtree(staging_parent)
+    except Exception as exc:  # noqa: BLE001 - published results remain authoritative.
+        print(
+            f"warning: published reviews but could not remove staging "
+            f"{staging_parent}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    try:
+        staging_pointer.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best effort.
+        print(
+            f"warning: published reviews but could not remove staging pointer "
+            f"{staging_pointer}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def terminal_exit_code(status: str) -> int:
+    if status == "success":
+        return 0
+    if status == "partial_failure":
+        return 3
+    return 4
+
+
 def write_artifact_failure_manifest(
     run_dir: Path,
     run_id: str,
@@ -1429,25 +1671,26 @@ def execute_reviews(
     started_threads: list[threading.Thread] = []
 
     try:
-        try:
-            for thread in threads:
-                thread.start()
-                started_threads.append(thread)
-            for thread in started_threads:
-                thread.join()
-        except KeyboardInterrupt:
-            interrupted_signal = signal.SIGINT
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            coordinator.terminate_all()
-        except RunInterrupted as exc:
-            interrupted_signal = exc.signum
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            coordinator.terminate_all()
-        finally:
-            if interrupted_signal is not None:
+        with SupervisorHeartbeat(run_id):
+            try:
+                for thread in threads:
+                    thread.start()
+                    started_threads.append(thread)
+                for thread in started_threads:
+                    thread.join()
+            except KeyboardInterrupt:
+                interrupted_signal = signal.SIGINT
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 coordinator.terminate_all()
-            for thread in started_threads:
-                thread.join()
+            except RunInterrupted as exc:
+                interrupted_signal = exc.signum
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                coordinator.terminate_all()
+            finally:
+                if interrupted_signal is not None:
+                    coordinator.terminate_all()
+                for thread in started_threads:
+                    thread.join()
     finally:
         signal.signal(signal.SIGTERM, old_sigterm)
 
@@ -1493,23 +1736,7 @@ def execute_reviews(
         print(f"ERROR={type(exc).__name__}: {exc}", file=sys.stderr)
         return 74
 
-    try:
-        shutil.rmtree(staging_parent)
-    except Exception as exc:  # noqa: BLE001 - published results remain authoritative.
-        print(
-            f"warning: published reviews but could not remove staging "
-            f"{staging_parent}: {exc}",
-            file=sys.stderr,
-        )
-    else:
-        try:
-            staging_pointer.unlink(missing_ok=True)
-        except Exception as exc:  # noqa: BLE001 - cleanup is best effort.
-            print(
-                f"warning: published reviews but could not remove staging pointer "
-                f"{staging_pointer}: {exc}",
-                file=sys.stderr,
-            )
+    cleanup_published_staging(staging_parent, staging_pointer)
     notify_terminal_status(notification_mode, run_dir, run_id, status)
     print(f"RUN_DIR={run_dir}")
     print(f"STATUS={status}")
@@ -1523,11 +1750,7 @@ def execute_reviews(
         return 130
     if interrupted_signal is not None:
         return 128 + interrupted_signal
-    if status == "success":
-        return 0
-    if status == "partial_failure":
-        return 3
-    return 4
+    return terminal_exit_code(status)
 
 
 def prepare_run(args: argparse.Namespace) -> int:
@@ -1557,6 +1780,137 @@ def has_meaningful_startup_stderr(text: str) -> bool:
             continue
         return True
     return False
+
+
+def reviewer_artifact_paths(
+    staging_dir: Path,
+    run_id: str,
+    reviewer: Reviewer,
+) -> tuple[Path, Path, Path]:
+    stem = f"{run_id}-{reviewer.ordinal:02d}-{reviewer.key}"
+    return (
+        staging_dir / f"{stem}.events.jsonl",
+        staging_dir / f"{stem}.stderr.log",
+        staging_dir / f"{stem}.md",
+    )
+
+
+def resolve_preserved_staging(run_dir: Path, run_id: str) -> Path:
+    pointer = run_dir / f".{run_id}-staging"
+    if not pointer.is_file():
+        raise ValueError(f"staging pointer does not exist: {pointer}")
+    try:
+        raw_path = pointer.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"could not read staging pointer: {exc}") from exc
+    if not raw_path:
+        raise ValueError(f"staging pointer is empty: {pointer}")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        raise ValueError("staging pointer must contain an absolute path")
+    try:
+        staging_dir = candidate.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"could not resolve preserved staging path: {exc}") from exc
+    expected_parent_prefix = f"{run_id}-staging-"
+    if (
+        staging_dir.name != run_id
+        or not staging_dir.parent.name.startswith(expected_parent_prefix)
+        or staging_dir == run_dir
+    ):
+        raise ValueError(
+            "staging pointer does not identify a Monju-owned preserved staging "
+            "directory"
+        )
+    if not staging_dir.is_dir():
+        raise ValueError(f"preserved staging directory does not exist: {staging_dir}")
+    return staging_dir
+
+
+def assess_recovery(run_dir: Path, run_id: str) -> RecoveryAssessment:
+    try:
+        staging_dir = resolve_preserved_staging(run_dir, run_id)
+    except ValueError as exc:
+        return RecoveryAssessment(
+            state="invalid",
+            staging_dir=None,
+            streams=(),
+            terminal_results=0,
+            successful_results=0,
+            can_publish=False,
+            errors=(str(exc),),
+        )
+
+    streams: list[RecoveryStream] = []
+    assessment_errors: list[str] = []
+    terminal_results = 0
+    successful_results = 0
+    invalid = False
+    for reviewer in REVIEWERS:
+        events_path, stderr_path, _ = reviewer_artifact_paths(
+            staging_dir,
+            run_id,
+            reviewer,
+        )
+        parsed: ParsedEventStream | None = None
+        read_error: str | None = None
+        validation_errors: tuple[str, ...] = ()
+        terminal_complete = False
+        if not events_path.is_file():
+            read_error = f"event stream is missing for {reviewer.display_name}"
+        else:
+            try:
+                parsed = inspect_event_stream(events_path)
+            except OSError as exc:
+                read_error = (
+                    f"could not read event stream for {reviewer.display_name}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                invalid = True
+            else:
+                terminal_complete = parsed.terminal_result_count > 0
+                if terminal_complete:
+                    terminal_results += 1
+                validation_errors = tuple(parsed_review_errors(reviewer, parsed))
+                if parsed.malformed_lines:
+                    invalid = True
+                if terminal_complete and validation_errors:
+                    invalid = True
+                if terminal_complete and not validation_errors:
+                    successful_results += 1
+        if read_error:
+            assessment_errors.append(read_error)
+        assessment_errors.extend(
+            f"{reviewer.display_name}: {error}" for error in validation_errors
+        )
+        streams.append(
+            RecoveryStream(
+                reviewer=reviewer,
+                events_path=events_path,
+                stderr_path=stderr_path,
+                parsed=parsed,
+                terminal_complete=terminal_complete,
+                validation_errors=validation_errors,
+                read_error=read_error,
+            )
+        )
+
+    can_publish = terminal_results == len(REVIEWERS)
+    if invalid:
+        state = "invalid"
+    elif can_publish:
+        state = "ready"
+    else:
+        state = "not_ready"
+    return RecoveryAssessment(
+        state=state,
+        staging_dir=staging_dir,
+        streams=tuple(streams),
+        terminal_results=terminal_results,
+        successful_results=successful_results,
+        can_publish=can_publish,
+        errors=tuple(assessment_errors),
+    )
 
 
 def diagnose_stale_run(run_dir: Path, run_id: str) -> dict[str, Any]:
@@ -1589,16 +1943,12 @@ def diagnose_stale_run(run_dir: Path, run_id: str) -> dict[str, Any]:
             diagnostics["reviewers_with_events"] += 1
             event_bytes += event_size
         try:
-            reported_model, _, final_text, stream_error, _ = parse_event_stream(
-                events_path
-            )
+            parsed = inspect_event_stream(events_path)
         except OSError:
-            reported_model = None
-            final_text = None
-            stream_error = None
-        if model_matches(reviewer, reported_model):
+            parsed = None
+        if parsed is not None and model_matches(reviewer, parsed.reported_model):
             diagnostics["initialized_reviewers"] += 1
-        if final_text:
+        if parsed is not None and parsed.terminal_result_count:
             diagnostics["completed_reviewers"] += 1
         try:
             stderr_text = stderr_path.read_text(
@@ -1607,7 +1957,10 @@ def diagnose_stale_run(run_dir: Path, run_id: str) -> dict[str, Any]:
             )
         except OSError:
             stderr_text = ""
-        if stream_error or has_meaningful_startup_stderr(stderr_text):
+        if (
+            (parsed is not None and parsed.stream_error)
+            or has_meaningful_startup_stderr(stderr_text)
+        ):
             diagnostics["startup_error_reviewers"] += 1
 
     supervisor_stderr_path = run_dir / f"{run_id}-runner.stderr.log"
@@ -1656,7 +2009,10 @@ def read_status(args: argparse.Namespace) -> int:
     runner_pid: str | None = None
     if pid_file.is_file():
         runner_pid = pid_file.read_text(encoding="utf-8").strip()
+    elif isinstance(payload.get("supervisor_pid"), int):
+        runner_pid = str(payload["supervisor_pid"])
     stale_diagnostics: dict[str, Any] | None = None
+    recovery: RecoveryAssessment | None = None
     if status == "running" and runner_pid:
         try:
             runner_running = process_is_running(int(runner_pid))
@@ -1665,6 +2021,7 @@ def read_status(args: argparse.Namespace) -> int:
         if not runner_running:
             status = "stale_running"
             stale_diagnostics = diagnose_stale_run(run_dir, run_id)
+            recovery = assess_recovery(run_dir, run_id)
     print(f"RUN_DIR={run_dir}")
     print(f"STATUS={status}")
     print(f"MANIFEST={path}")
@@ -1688,6 +2045,24 @@ def read_status(args: argparse.Namespace) -> int:
         staging_preserved = stale_diagnostics["staging_preserved"]
         if staging_preserved:
             print(f"STAGING_PRESERVED={staging_preserved}")
+        if recovery is not None:
+            print(f"RECOVERY={recovery.state}")
+            print(
+                f"RECOVERY_TERMINAL_RESULTS={recovery.terminal_results}/"
+                f"{len(REVIEWERS)}"
+            )
+            print(
+                f"RECOVERY_SUCCESSFUL_RESULTS={recovery.successful_results}/"
+                f"{len(REVIEWERS)}"
+            )
+            print(
+                "RECOVERY_CAN_PUBLISH="
+                f"{'yes' if recovery.can_publish else 'no'}"
+            )
+    elif status in TERMINAL_STATUSES:
+        print("RECOVERY=published")
+    elif status != "running":
+        print("RECOVERY=invalid")
     for result in payload.get("results", []):
         if not isinstance(result, dict):
             continue
@@ -1708,6 +2083,366 @@ def read_status(args: argparse.Namespace) -> int:
             + (f" BACKEND={backend}" if backend else "")
         )
     return 0
+
+
+def read_manifest_for_recovery(run_dir: Path, run_id: str) -> dict[str, Any]:
+    path = manifest_path(run_dir, run_id)
+    if not path.is_file():
+        raise ValueError(f"manifest does not exist: {path}")
+    try:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"could not read manifest: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("manifest root must be a JSON object")
+    manifest_run_id = decoded.get("run_id")
+    if manifest_run_id is not None and manifest_run_id != run_id:
+        raise ValueError(
+            f"manifest run_id does not match its directory: {manifest_run_id!r}"
+        )
+    return decoded
+
+
+def recorded_supervisor_pid(
+    payload: dict[str, Any],
+    run_dir: Path,
+    run_id: str,
+) -> int:
+    value = payload.get("supervisor_pid")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    pid_path = run_dir / f"{run_id}-runner.pid"
+    try:
+        raw_pid = pid_path.read_text(encoding="utf-8").strip()
+        pid = int(raw_pid)
+    except (OSError, ValueError) as exc:
+        raise ValueError("running manifest has no valid recorded supervisor PID") from exc
+    if pid <= 0:
+        raise ValueError("running manifest has no valid recorded supervisor PID")
+    return pid
+
+
+def validate_recovery_prompt(
+    payload: dict[str, Any],
+    run_dir: Path,
+    run_id: str,
+    staging_dir: Path,
+) -> tuple[Path, str, str]:
+    prompt_file = default_prompt_path(run_dir, run_id)
+    review_brief, effective_prompt = read_review_brief(prompt_file)
+    expected_hash = payload.get("effective_prompt_sha256")
+    if not isinstance(expected_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}",
+        expected_hash,
+    ):
+        raise ValueError("running manifest has no valid effective prompt hash")
+    calculated_hash = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
+    if calculated_hash != expected_hash:
+        raise ValueError(
+            "current review brief does not match the prompt recorded at launch"
+        )
+    staged_prompt = staging_dir / f"{run_id}-00-effective-prompt.md"
+    try:
+        staged_hash = hashlib.sha256(staged_prompt.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(
+            f"could not read staged effective prompt: {type(exc).__name__}: {exc}"
+        ) from exc
+    if staged_hash != expected_hash:
+        raise ValueError(
+            "staged effective prompt does not match the prompt recorded at launch"
+        )
+    return prompt_file, review_brief, effective_prompt
+
+
+def recovered_review_result(
+    stream: RecoveryStream,
+    run_id: str,
+) -> tuple[ReviewResult, str | None, str]:
+    parsed = stream.parsed
+    if parsed is None or not stream.terminal_complete:
+        raise ValueError(
+            f"terminal event stream is unavailable for {stream.reviewer.display_name}"
+        )
+    _, _, markdown_path = reviewer_artifact_paths(
+        stream.events_path.parent,
+        run_id,
+        stream.reviewer,
+    )
+    stderr_path = stream.stderr_path
+    try:
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        stderr_text = ""
+    try:
+        completed_at = datetime.fromtimestamp(
+            stream.events_path.stat().st_mtime,
+            UTC,
+        ).isoformat(timespec="milliseconds")
+    except OSError:
+        completed_at = None
+
+    errors = list(stream.validation_errors)
+    verified = model_matches(stream.reviewer, parsed.reported_model)
+    result = ReviewResult(
+        reviewer=stream.reviewer.display_name,
+        requested_model=stream.reviewer.model_id,
+        reported_model=parsed.reported_model,
+        model_verified=verified,
+        session_id=parsed.session_id,
+        status="success" if not errors else "failed",
+        exit_code=None,
+        timed_out=None,
+        started_at=None,
+        completed_at=completed_at,
+        duration_seconds=parsed.terminal_duration_seconds,
+        markdown_file=markdown_path.name,
+        events_file=stream.events_path.name,
+        stderr_file=stderr_path.name,
+        command=None,
+        error="; ".join(errors) if errors else None,
+        warnings=[
+            *parsed.warnings,
+            (
+                "Recovered from a preserved Cursor event stream after supervisor "
+                "loss; reviewer start time and process exit status are unavailable."
+            ),
+        ],
+        recovered=True,
+        timing_source={
+            "started_at": None,
+            "completed_at": (
+                "event_stream_file_mtime" if completed_at is not None else None
+            ),
+            "duration_seconds": (
+                "terminal_result.duration_ms"
+                if parsed.terminal_duration_seconds is not None
+                else None
+            ),
+        },
+        recovery_validation={
+            "event_count": parsed.event_count,
+            "terminal_result_count": parsed.terminal_result_count,
+            "terminal_result_is_last": parsed.terminal_result_is_last,
+            "malformed_event_lines": list(parsed.malformed_lines),
+            "model_verified": verified,
+            "errors": errors,
+        },
+    )
+    return result, parsed.final_text, stderr_text
+
+
+def report_recovery_refusal(
+    run_dir: Path,
+    status: str,
+    recovery: str,
+    staging_dir: Path | None = None,
+    detail: str | None = None,
+) -> int:
+    print(f"RUN_DIR={run_dir}")
+    print(f"STATUS={status}")
+    print(f"RECOVERY={recovery}")
+    if detail:
+        print(f"RECOVERY_REASON={detail}")
+    if staging_dir is not None:
+        print(f"STAGING_PRESERVED={staging_dir}")
+    return 75 if status == "recovery_not_ready" else 65
+
+
+def recover_review(args: argparse.Namespace) -> int:
+    if args.run_dir is None:
+        raise SystemExit("--recover requires --run-dir")
+    run_id, run_dir = validate_run_dir(args.run_dir)
+    try:
+        payload = read_manifest_for_recovery(run_dir, run_id)
+    except ValueError as exc:
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            detail=str(exc),
+        )
+
+    current_status = str(payload.get("status") or "unknown")
+    if current_status in TERMINAL_STATUSES:
+        return read_status(args)
+    if current_status != "running":
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            detail=f"manifest has unsupported status: {current_status}",
+        )
+    if args.notify in {"auto", "webhook"}:
+        raise SystemExit(
+            "--recover never uses the network; use --notify none or --notify desktop"
+        )
+
+    try:
+        original_supervisor_pid = recorded_supervisor_pid(
+            payload,
+            run_dir,
+            run_id,
+        )
+    except ValueError as exc:
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            detail=str(exc),
+        )
+    if process_is_running(original_supervisor_pid):
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_refused",
+            "refused",
+            detail="recorded supervisor PID is still running",
+        )
+
+    assessment = assess_recovery(run_dir, run_id)
+    if not assessment.can_publish:
+        state = (
+            "recovery_not_ready"
+            if assessment.state == "not_ready"
+            else "recovery_invalid"
+        )
+        if assessment.staging_dir is None and assessment.errors:
+            detail = assessment.errors[0]
+        elif assessment.state == "not_ready":
+            detail = (
+                "not all reviewer streams contain a terminal result "
+                f"({assessment.terminal_results}/{len(REVIEWERS)})"
+            )
+        else:
+            detail = (
+                "one or more preserved event streams are malformed or "
+                "unverifiable"
+            )
+        return report_recovery_refusal(
+            run_dir,
+            state,
+            assessment.state,
+            assessment.staging_dir,
+            detail,
+        )
+    staging_dir = assessment.staging_dir
+    if staging_dir is None:
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+        )
+
+    try:
+        prompt_file, _review_brief, effective_prompt = validate_recovery_prompt(
+            payload,
+            run_dir,
+            run_id,
+            staging_dir,
+        )
+    except (OSError, SystemExit, ValueError) as exc:
+        detail = str(exc)
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            staging_dir,
+            detail,
+        )
+
+    workspace_value = payload.get("workspace")
+    if not isinstance(workspace_value, str) or not workspace_value:
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            staging_dir,
+            "running manifest has no workspace",
+        )
+    workspace = Path(workspace_value).expanduser().resolve()
+    recovered_at = iso_now()
+    results: list[ReviewResult] = []
+    try:
+        for stream in assessment.streams:
+            result, final_text, stderr_text = recovered_review_result(
+                stream,
+                run_id,
+            )
+            results.append(result)
+            markdown_path = staging_dir / result.markdown_file
+            atomic_write_text(
+                markdown_path,
+                markdown_report(
+                    stream.reviewer,
+                    result,
+                    final_text,
+                    stderr_text,
+                ),
+            )
+        status = write_final_manifest(
+            staging_dir,
+            run_id,
+            workspace,
+            prompt_file,
+            effective_prompt,
+            results,
+            payload.get("started_at")
+            if isinstance(payload.get("started_at"), str)
+            else None,
+            None,
+            args.notify,
+            supervisor_pid=original_supervisor_pid,
+            completed_at=recovered_at,
+            extra_fields={
+                "recovered": True,
+                "recovered_at": recovered_at,
+                "recovery_source": RECOVERY_SOURCE,
+                "original_supervisor_pid": original_supervisor_pid,
+                "recovery_pid": os.getpid(),
+                "completed_at_source": "recovery_publication_time",
+                "review_completed_at": None,
+                "recovery_assessment": assessment.state,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - raw staging must survive recovery.
+        print(f"RUN_DIR={run_dir}")
+        print("STATUS=recovery_failure")
+        print(f"STAGING_PRESERVED={staging_dir}")
+        print(f"ERROR={type(exc).__name__}: {exc}", file=sys.stderr)
+        return 74
+
+    try:
+        publish_staging(staging_dir, run_dir)
+    except Exception as exc:  # noqa: BLE001 - raw staging must survive recovery.
+        write_artifact_failure_manifest(run_dir, run_id, staging_dir, exc)
+        notify_terminal_status(
+            args.notify,
+            run_dir,
+            run_id,
+            "artifact_failure",
+        )
+        print(f"RUN_DIR={run_dir}")
+        print("STATUS=artifact_failure")
+        print(f"STAGING_PRESERVED={staging_dir}")
+        print(f"ERROR={type(exc).__name__}: {exc}", file=sys.stderr)
+        return 74
+
+    cleanup_published_staging(
+        staging_dir.parent,
+        run_dir / f".{run_id}-staging",
+    )
+    notify_terminal_status(args.notify, run_dir, run_id, status)
+    print(f"RUN_DIR={run_dir}")
+    print(f"STATUS={status}")
+    print("RECOVERED=true")
+    for result in results:
+        print(
+            f"RESULT {result.reviewer}: {result.status} "
+            f"{run_dir / result.markdown_file}"
+        )
+    return terminal_exit_code(status)
 
 
 def dry_run(args: argparse.Namespace) -> int:
@@ -1834,6 +2569,16 @@ def main() -> int:
         return prepare_run(args)
     if args.status:
         return read_status(args)
+    if args.recover:
+        try:
+            return recover_review(args)
+        except Exception as exc:  # noqa: BLE001 - recovery must stay non-destructive.
+            print(
+                f"Monju recovery failed without publishing: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 70
     if args.dry_run:
         return dry_run(args)
     try:

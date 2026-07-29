@@ -272,6 +272,18 @@ the managed background terminal continues owning the supervisor. Do not add
 `&`, `nohup`, `setsid`, or `--background`. A human invoking the command directly
 must leave that terminal command running until review completion.
 
+While reviewers are active, the supervisor writes and flushes a compact line
+about every 30 seconds:
+
+```text
+MONJU_HEARTBEAT run_id=<run-id> elapsed_seconds=<n>
+```
+
+This is runner-owned liveness output, not Codex polling. It contains no prompt,
+workspace path, webhook URL, or credential data. It may prevent an idle cleanup,
+but cannot keep a managed exec session alive past a hard TTL. The observed
+supervisor loss has not yet been proven to be either idle cleanup or a hard TTL.
+
 Check it later without waiting:
 
 ```bash
@@ -282,10 +294,32 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 
 `--status` reports `stale_running` when a run still says `running` but its
 recorded supervisor process no longer exists. It also reports `STALE_REASON`,
-reviewer progress counts, and the preserved staging path. Initialized or
-completed reviewers indicate external termination after real progress; meaningful
-stderr without any initialization indicates startup failure. The known
-`LC_ALL=C.UTF-8` locale warning is ignored for this classification.
+reviewer progress counts, the preserved staging path, and
+`RECOVERY=ready|not_ready|invalid`. Initialized or completed reviewers indicate
+external termination after real progress; meaningful stderr without any
+initialization indicates startup failure. The known `LC_ALL=C.UTF-8` locale
+warning is ignored for this classification.
+
+When `RECOVERY_TERMINAL_RESULTS=3/3` and `RECOVERY_CAN_PUBLISH=yes`, recover the
+preserved results once:
+
+```bash
+uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+  --recover \
+  --run-dir "/absolute/path/from/RUN_DIR"
+```
+
+Recovery never invokes Cursor, contacts an external LLM, substitutes a model, or
+retries a reviewer. It validates the same fixed model allowlist and stream rules,
+then publishes three Markdown files plus a terminal manifest. `RECOVERY=invalid`
+with all three terminal events can still be published, but the invalid reviewer
+becomes a normal partial/failure result. A missing terminal event produces
+`recovery_not_ready` without changing the manifest or artifacts. If publication
+fails, raw staging and its pointer remain available. Repeating `--recover` after
+a terminal manifest was published is a read-only no-op. `--status` itself never
+recovers a run. Recovery permits only `--notify none` (the default) or the local
+`desktop` backend; `auto` and `webhook` are rejected to preserve the no-network
+guarantee.
 
 Runner options:
 
@@ -294,6 +328,7 @@ Runner options:
 --prepare               Create a unique run directory and empty brief
 --background            Rejected; use a foreground Codex background terminal
 --status                Read current status without waiting
+--recover               Validate and publish completed preserved event streams
 --run-dir PATH          Prepared run directory
 --agent-bin PATH        Cursor CLI executable; default: agent
 --timeout-seconds N     Per-reviewer timeout; default: 3600
@@ -394,6 +429,12 @@ are published; this includes WSL2. In the best-effort native-Windows path,
 direct Cursor processes are terminated, while helper descendants depend on
 Cursor CLI cleanup. If publishing fails, the manifest records
 `staging_preserved` when possible.
+
+If an uncatchable termination or managed exec-session cleanup kills the
+supervisor after reviewers finish, the running manifest can remain stale even
+though raw streams are complete. The heartbeat addresses only the idle-cleanup
+hypothesis. Safe recovery addresses already-completed streams; neither feature
+proves the cause or guarantees survival past a hard TTL.
 
 For troubleshooting:
 
@@ -665,6 +706,18 @@ terminalが引き続き監督プロセスを所有します。`&`、`nohup`、`s
 `--background`は使いません。人が直接実行する場合は、レビュー完了までその
 ターミナルコマンドを動かしておく必要があります。
 
+レビュー実行中、監督プロセス自身が約30秒ごとに次の短い行をstdoutへ出力し、
+必ずflushします。
+
+```text
+MONJU_HEARTBEAT run_id=<run-id> elapsed_seconds=<n>
+```
+
+これはCodexによるポーリングではなく、runner内部の生存出力です。prompt、
+workspaceパス、Webhook URL、認証情報は含みません。idle cleanupを避けられる
+可能性はありますが、管理対象exec sessionのhard TTLには効きません。実際に
+観測された監督プロセス消失がidle cleanupとhard TTLのどちらかは未確定です。
+
 後から、待機せず状態を確認します。
 
 ```bash
@@ -675,9 +728,28 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 
 マニフェストが`running`のまま監督プロセスだけ終了している場合、`--status`は
 `stale_running`に加え、`STALE_REASON`、レビュワーごとの進捗数、保存済みstaging
-パスを表示します。initまたはfinalイベントがあれば実処理後の外部終了、
-初期化がなく意味のあるstderrだけがあれば起動失敗と分類します。既知の
-`LC_ALL=C.UTF-8` locale警告はこの分類では無視します。
+パス、`RECOVERY=ready|not_ready|invalid`を表示します。initまたはfinalイベント
+があれば実処理後の外部終了、初期化がなく意味のあるstderrだけがあれば起動失敗
+と分類します。既知の`LC_ALL=C.UTF-8` locale警告はこの分類では無視します。
+
+`RECOVERY_TERMINAL_RESULTS=3/3`かつ`RECOVERY_CAN_PUBLISH=yes`の場合だけ、保存済み
+結果を一度recoverできます。
+
+```bash
+uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+  --recover \
+  --run-dir "/RUN_DIRで表示された絶対パス"
+```
+
+recoverはCursorや外部LLMへ接続せず、モデルの代替や再実行もしません。通常実行と
+同じ固定model allowlistとstream検証を通し、3件のMarkdownと終端manifestを公開
+します。3件のterminal eventが揃っていても`RECOVERY=invalid`なら、不正な結果は
+通常どおりpartial/failureとして記録されます。terminal eventが不足している場合は
+`recovery_not_ready`となり、manifestや成果物を変更しません。公開失敗時はraw
+stagingとpointerを保持します。終端manifest公開後の再recoverは読み取り専用の
+no-opです。`--status`が自動recoverすることはありません。no-network保証を保つ
+ため、recover時の通知は`none`（既定）またはlocalの`desktop`だけを許可し、
+`auto`と`webhook`は拒否します。
 
 ランナーのオプション:
 
@@ -686,6 +758,7 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 --prepare               一意な実行フォルダと空のbriefを作成
 --background            拒否。Codex background terminalの前景で実行
 --status                待機せず現在の状態を表示
+--recover               完了済み保存event streamを検証・公開
 --run-dir PATH          準備済み実行フォルダ
 --agent-bin PATH        Cursor CLI実行ファイル。既定値: agent
 --timeout-seconds N     レビュワーごとの制限時間。既定値: 3600
@@ -784,6 +857,11 @@ export MONJU_NOTIFY_WEBHOOK_URL="https://notification-service.example/hook"
 effortのWindowsネイティブ経路では直接のCursorプロセスだけを終了し、ヘルパー
 の子孫プロセスはCursor CLI側の後始末に依存します。公開に失敗した場合は、
 可能な限り`staging_preserved`へ保存先を記録します。
+
+捕捉不能な終了や管理対象exec sessionのcleanupによって、全reviewer完了後も
+manifestが`running`のまま残る場合があります。heartbeatが扱うのはidle cleanup
+仮説だけで、safe recoveryが扱うのはすでに完成したstreamの成果物化だけです。
+どちらも原因を確定するものではなく、hard TTLを越えた生存は保証しません。
 
 トラブルシューティング:
 
