@@ -150,6 +150,8 @@ PRIVATE_DIR_MODE = 0o700
 NOTIFICATION_WEBHOOK_ENV = "MONJU_NOTIFY_WEBHOOK_URL"
 NOTIFICATION_TIMEOUT_SECONDS = 10
 INTERNAL_WORKER_ENV = "MONJU_INTERNAL_WORKER"
+BACKGROUND_STARTUP_GRACE_SECONDS = 2.0
+BACKGROUND_STARTUP_POLL_SECONDS = 0.05
 
 
 @dataclass
@@ -242,6 +244,14 @@ def parse_args() -> argparse.Namespace:
         help="Create a unique run directory and empty review-brief file, then exit.",
     )
     mode.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Check Cursor state access, workspace trust, and authentication "
+            "without starting a review."
+        ),
+    )
+    mode.add_argument(
         "--background",
         action="store_true",
         help="Start the review supervisor in the background and return immediately.",
@@ -290,17 +300,32 @@ def completion_message(run_id: str, status: str, run_dir: Path) -> str:
     return f"Monju review {status}\nRun: {run_id}\nResults: {run_dir}"
 
 
+def macos_notification_script() -> str:
+    return (
+        "function run(argv) {\n"
+        "  const app = Application.currentApplication();\n"
+        "  app.includeStandardAdditions = true;\n"
+        "  app.displayNotification(argv[1], {withTitle: argv[0]});\n"
+        "}"
+    )
+
+
 def run_desktop_notification(title: str, message: str) -> str:
     if sys.platform == "darwin":
         executable = shutil.which("osascript")
         if not executable:
             raise RuntimeError("osascript was not found")
-        script = (
-            "on run argv\n"
-            "display notification (item 2 of argv) with title (item 1 of argv)\n"
-            "end run"
-        )
-        command = [executable, "-e", script, title, message]
+        script = macos_notification_script()
+        command = [
+            executable,
+            "-l",
+            "JavaScript",
+            "-e",
+            script,
+            "--",
+            title,
+            message,
+        ]
         backend = "macos"
     elif sys.platform.startswith("linux"):
         executable = shutil.which("notify-send")
@@ -1109,6 +1134,94 @@ def ensure_file_credentials_default() -> None:
     os.environ.setdefault("AGENT_CLI_CREDENTIAL_STORE", "file")
 
 
+def cursor_projects_directory() -> Path:
+    return Path.home() / ".cursor" / "projects"
+
+
+def workspace_trust_marker(
+    workspace: Path,
+    projects_dir: Path | None = None,
+) -> Path | None:
+    projects = projects_dir or cursor_projects_directory()
+    try:
+        project_dirs = list(projects.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SystemExit(
+            "PREFLIGHT=cursor_state_unwritable\n"
+            f"Cursor CLI state is not accessible: {projects}\n"
+            f"{type(exc).__name__}: {exc}\n"
+            "Rerun this preflight and the eventual review launch outside the "
+            "filesystem sandbox."
+        ) from exc
+
+    expected = os.path.normcase(str(workspace.resolve()))
+    for project_dir in project_dirs:
+        marker = project_dir / ".workspace-trusted"
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        trusted_path = payload.get("workspacePath")
+        if not isinstance(trusted_path, str):
+            continue
+        candidate = os.path.normcase(str(Path(trusted_path).expanduser().resolve()))
+        if candidate == expected:
+            return marker
+    return None
+
+
+def verify_cursor_state_writable(workspace: Path) -> Path:
+    projects = cursor_projects_directory()
+    marker = workspace_trust_marker(workspace, projects)
+    target = marker.parent if marker is not None else projects
+    probe = target / f".monju-write-probe-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        target.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
+        descriptor = os.open(
+            probe,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            PRIVATE_FILE_MODE,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write("Monju Cursor state write probe\n")
+        probe.unlink()
+    except OSError as exc:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SystemExit(
+            "PREFLIGHT=cursor_state_unwritable\n"
+            f"Cursor CLI cannot write its state directory: {target}\n"
+            f"{type(exc).__name__}: {exc}\n"
+            "Rerun this preflight and the eventual review launch outside the "
+            "filesystem sandbox."
+        ) from exc
+    return projects
+
+
+def verify_workspace_trust(workspace: Path, projects_dir: Path) -> Path:
+    marker = workspace_trust_marker(workspace, projects_dir)
+    if marker is not None:
+        return marker
+    command = (
+        "AGENT_CLI_CREDENTIAL_STORE=file agent --workspace "
+        f"{shlex.quote(str(workspace))} --trust"
+    )
+    raise SystemExit(
+        "PREFLIGHT=workspace_trust_required\n"
+        f"Cursor CLI has not recorded trust for this workspace: {workspace}\n"
+        "Have the calling coding agent run this exact command with a PTY outside "
+        "the filesystem sandbox. After Cursor reaches its initial prompt, the "
+        "agent should interrupt it without submitting a prompt and rerun preflight:\n"
+        f"  {command}\n"
+        "This command grants Cursor Workspace Trust only. Do not use --yolo or "
+        "--force, and do not edit Cursor's trust marker directly."
+    )
+
+
 def verify_authentication(agent_bin: str) -> None:
     try:
         result = subprocess.run(
@@ -1133,6 +1246,24 @@ def verify_authentication(agent_bin: str) -> None:
             "  AGENT_CLI_CREDENTIAL_STORE=file agent login\n"
             f"Status output:\n{detail}"
         )
+
+
+def run_preflight_checks(workspace: Path, agent_bin: str) -> tuple[Path, Path]:
+    projects = verify_cursor_state_writable(workspace)
+    verify_authentication(agent_bin)
+    trust_marker = verify_workspace_trust(workspace, projects)
+    return projects, trust_marker
+
+
+def preflight_run(args: argparse.Namespace) -> int:
+    workspace = resolve_workspace(args)
+    agent_bin = resolve_executable(args.agent_bin)
+    projects, trust_marker = run_preflight_checks(workspace, agent_bin)
+    print("PREFLIGHT=ok")
+    print(f"WORKSPACE={workspace}")
+    print(f"CURSOR_PROJECTS_DIR={projects}")
+    print(f"WORKSPACE_TRUST={trust_marker}")
+    return 0
 
 
 def claim_run(run_dir: Path) -> Path:
@@ -1537,6 +1668,71 @@ def build_worker_command(
     ]
 
 
+def reviewers_initialized(run_dir: Path, run_id: str) -> bool:
+    pointer = run_dir / f".{run_id}-staging"
+    try:
+        staging_dir = Path(pointer.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+    for reviewer in REVIEWERS:
+        events_path = staging_dir / (
+            f"{run_id}-{reviewer.ordinal:02d}-{reviewer.key}.events.jsonl"
+        )
+        try:
+            reported_model, _, _, _, _ = parse_event_stream(events_path)
+        except OSError:
+            return False
+        if not model_matches(reviewer, reported_model):
+            return False
+    return True
+
+
+def terminal_manifest_status(run_dir: Path, run_id: str) -> str | None:
+    path = manifest_path(run_dir, run_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    status = payload.get("status")
+    if not isinstance(status, str) or status == "running":
+        return None
+    return status
+
+
+def wait_for_background_startup(
+    proc: subprocess.Popen[bytes],
+    run_dir: Path,
+    run_id: str,
+) -> tuple[str, str | None]:
+    deadline = time.monotonic() + BACKGROUND_STARTUP_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if reviewers_initialized(run_dir, run_id):
+            return "confirmed", None
+        status = terminal_manifest_status(run_dir, run_id)
+        if status is not None:
+            return "failed", status
+        time.sleep(BACKGROUND_STARTUP_POLL_SECONDS)
+
+    status = terminal_manifest_status(run_dir, run_id)
+    if status is not None:
+        return "failed", status
+    if proc.poll() is not None:
+        return "failed", "stale_running"
+    return "pending", None
+
+
+def background_terminal_exit_code(status: str) -> int:
+    return {
+        "success": 0,
+        "partial_failure": 3,
+        "failure": 4,
+        "interrupted": 130,
+        "artifact_failure": 74,
+        "supervisor_failure": 70,
+        "stale_running": 70,
+    }.get(status, 70)
+
+
 def launch_background(
     workspace: Path,
     prompt_file: Path,
@@ -1594,10 +1790,18 @@ def launch_background(
 
     pid_path = run_dir / f"{run_id}-runner.pid"
     atomic_write_text(pid_path, f"{proc.pid}\n")
+    startup, terminal_status = wait_for_background_startup(proc, run_dir, run_id)
     print(f"RUN_DIR={run_dir}")
-    print("STATUS=running")
+    if terminal_status is not None:
+        print(f"STATUS={terminal_status}")
+        print("STARTUP=failed")
+    else:
+        print("STATUS=running")
+        print(f"STARTUP={startup}")
     print(f"RUNNER_PID={proc.pid}")
     print(f"MANIFEST={manifest_path(run_dir, run_id)}")
+    if terminal_status is not None:
+        return background_terminal_exit_code(terminal_status)
     return 0
 
 
@@ -1621,7 +1825,7 @@ def run_requested_review(args: argparse.Namespace) -> int:
             raise SystemExit("internal worker requires a claimed run directory")
     review_brief, effective_prompt = read_review_brief(prompt_file)
     agent_bin = resolve_executable(args.agent_bin)
-    verify_authentication(agent_bin)
+    run_preflight_checks(workspace, agent_bin)
 
     if args.background:
         return launch_background(
@@ -1678,6 +1882,8 @@ def main() -> int:
         raise SystemExit("--_worker is reserved for the detached Monju supervisor")
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be greater than zero")
+    if args.preflight:
+        return preflight_run(args)
     if args.prepare:
         return prepare_run(args)
     if args.status:

@@ -39,6 +39,31 @@ none
 
 
 class RunnerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._test_home_context = tempfile.TemporaryDirectory()
+        self.test_home = Path(self._test_home_context.name)
+
+    def tearDown(self) -> None:
+        self._test_home_context.cleanup()
+
+    @staticmethod
+    def trust_workspace(workspace: Path, home: Path) -> Path:
+        project = home / ".cursor" / "projects" / (
+            f"workspace-{abs(hash(str(workspace.resolve())))}"
+        )
+        project.mkdir(parents=True, exist_ok=True)
+        marker = project / ".workspace-trusted"
+        marker.write_text(
+            json.dumps(
+                {
+                    "trustedAt": "2026-01-01T00:00:00.000Z",
+                    "workspacePath": str(workspace.resolve()),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return marker
+
     def make_fake_agent(self, directory: Path) -> Path:
         fake = directory / "fake-agent"
         fake.write_text(
@@ -62,6 +87,13 @@ class RunnerTestCase(unittest.TestCase):
                 ):
                     print("webhook secret leaked to reviewer", file=sys.stderr)
                     raise SystemExit(86)
+
+                if os.environ.get("FAKE_AGENT_STARTUP_FAILURE"):
+                    print(
+                        os.environ["FAKE_AGENT_STARTUP_FAILURE"],
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(76)
 
                 model = sys.argv[sys.argv.index("--model") + 1]
                 reported = {{
@@ -98,12 +130,17 @@ class RunnerTestCase(unittest.TestCase):
         *arguments: str,
         env: dict[str, str] | None = None,
         timeout: float = 10,
+        trusted_workspace: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         command_env = os.environ.copy()
         command_env["AGENT_CLI_CREDENTIAL_STORE"] = "file"
         command_env.pop(run_monju.INTERNAL_WORKER_ENV, None)
+        command_env["HOME"] = str(self.test_home)
         if env:
             command_env.update(env)
+        if trusted_workspace and "--workspace" in arguments:
+            workspace = Path(arguments[arguments.index("--workspace") + 1])
+            self.trust_workspace(workspace, Path(command_env["HOME"]))
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
             cwd=REPOSITORY,
@@ -342,6 +379,72 @@ class RunnerTestCase(unittest.TestCase):
             self.assertIn("file credential store is not authenticated", result.stderr)
             self.assertEqual(list(output.glob("*/*.events.jsonl")), [])
 
+    def test_preflight_checks_state_trust_and_authentication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+
+            result = self.run_command(
+                "--preflight",
+                "--workspace",
+                str(workspace),
+                "--agent-bin",
+                str(fake),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PREFLIGHT=ok", result.stdout)
+            self.assertIn("WORKSPACE_TRUST=", result.stdout)
+
+    def test_preflight_reports_unwritable_cursor_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+            blocked_home = root / "blocked-home"
+            blocked_home.write_text("not a directory", encoding="utf-8")
+
+            result = self.run_command(
+                "--preflight",
+                "--workspace",
+                str(workspace),
+                "--agent-bin",
+                str(fake),
+                env={"HOME": str(blocked_home)},
+                trusted_workspace=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("PREFLIGHT=cursor_state_unwritable", result.stderr)
+            self.assertIn("outside the filesystem sandbox", result.stderr)
+
+    def test_preflight_requires_explicit_workspace_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+
+            result = self.run_command(
+                "--preflight",
+                "--workspace",
+                str(workspace),
+                "--agent-bin",
+                str(fake),
+                trusted_workspace=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("PREFLIGHT=workspace_trust_required", result.stderr)
+            self.assertIn("agent --workspace", result.stderr)
+            self.assertIn("--trust", result.stderr)
+            self.assertIn("calling coding agent", result.stderr)
+            self.assertNotIn("Run this yourself", result.stderr)
+            self.assertIn("Do not use --yolo or --force", result.stderr)
+
     def test_auto_notification_prefers_configured_webhook(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -368,6 +471,53 @@ class RunnerTestCase(unittest.TestCase):
         self.assertEqual(result.backend, "webhook")
         webhook.assert_called_once()
         desktop.assert_not_called()
+
+    def test_macos_notification_passes_arguments_after_separator(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(run_monju.sys, "platform", "darwin"),
+            mock.patch.object(run_monju.shutil, "which", return_value="osascript"),
+            mock.patch.object(
+                run_monju.subprocess,
+                "run",
+                return_value=completed,
+            ) as execute,
+        ):
+            backend = run_monju.run_desktop_notification("Monju", "done")
+
+        self.assertEqual(backend, "macos")
+        command = execute.call_args.args[0]
+        self.assertEqual(command[-3:], ["--", "Monju", "done"])
+        self.assertEqual(command[1:3], ["-l", "JavaScript"])
+        self.assertIn(
+            "app.displayNotification(argv[1], {withTitle: argv[0]})",
+            command[4],
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS AppleScript compiler")
+    def test_macos_notification_jxa_compiles(self) -> None:
+        executable = shutil.which("osacompile")
+        if executable is None:
+            self.skipTest("osacompile is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "notification.scpt"
+            result = subprocess.run(
+                [
+                    executable,
+                    "-l",
+                    "JavaScript",
+                    "-e",
+                    run_monju.macos_notification_script(),
+                    "-o",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_windows_desktop_notification_targets_current_user(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
@@ -422,29 +572,18 @@ class RunnerTestCase(unittest.TestCase):
             brief = root / "brief.md"
             brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
 
-            environment = os.environ.copy()
-            environment.pop(run_monju.NOTIFICATION_WEBHOOK_ENV, None)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--workspace",
-                    str(workspace),
-                    "--prompt-file",
-                    str(brief),
-                    "--output-root",
-                    str(output),
-                    "--agent-bin",
-                    str(fake),
-                    "--notify",
-                    "webhook",
-                ],
-                cwd=REPOSITORY,
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=10,
-                check=False,
+            result = self.run_command(
+                "--workspace",
+                str(workspace),
+                "--prompt-file",
+                str(brief),
+                "--output-root",
+                str(output),
+                "--agent-bin",
+                str(fake),
+                "--notify",
+                "webhook",
+                env={run_monju.NOTIFICATION_WEBHOOK_ENV: ""},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -530,6 +669,7 @@ class RunnerTestCase(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertLess(elapsed, 2)
             self.assertIn("STATUS=running", result.stdout)
+            self.assertIn("STARTUP=confirmed", result.stdout)
             manifest = self.wait_for_terminal_manifest(run_dir)
             self.assertEqual(manifest["status"], "success")
             self.assertEqual(manifest["notification"]["status"], "failed")
@@ -538,6 +678,107 @@ class RunnerTestCase(unittest.TestCase):
             self.assertEqual(status.returncode, 0, status.stderr)
             self.assertIn("STATUS=success", status.stdout)
             self.assertIn("NOTIFICATION=failed BACKEND=webhook", status.stdout)
+
+    def test_background_reports_immediate_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            output = root / "reviews"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+            run_dir, prompt = self.prepare(workspace, output)
+            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
+
+            result = self.run_command(
+                "--background",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--agent-bin",
+                str(fake),
+                env={"FAKE_AGENT_STARTUP_FAILURE": "Workspace Trust Required"},
+            )
+
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertIn("STATUS=failure", result.stdout)
+            self.assertIn("STARTUP=failed", result.stdout)
+            self.assertNotIn("STATUS=running", result.stdout)
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "failure")
+            self.assertTrue(
+                all(
+                    "Workspace Trust Required"
+                    in (run_dir / item["stderr_file"]).read_text(encoding="utf-8")
+                    for item in manifest["results"]
+                )
+            )
+
+    def test_background_startup_grace_can_return_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            with (
+                mock.patch.object(
+                    run_monju,
+                    "BACKGROUND_STARTUP_GRACE_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    run_monju,
+                    "BACKGROUND_STARTUP_POLL_SECONDS",
+                    0.001,
+                ),
+            ):
+                startup, status = run_monju.wait_for_background_startup(
+                    proc,
+                    run_dir,
+                    "monju-test",
+                )
+
+            self.assertEqual(startup, "pending")
+            self.assertIsNone(status)
+
+    def test_background_does_not_claim_run_before_trust_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            output = root / "reviews"
+            workspace.mkdir()
+            fake = self.make_fake_agent(root)
+            run_dir, prompt = self.prepare(workspace, output)
+            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
+            for marker in self.test_home.glob(
+                ".cursor/projects/*/.workspace-trusted"
+            ):
+                marker.unlink()
+
+            result = self.run_command(
+                "--background",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--agent-bin",
+                str(fake),
+                trusted_workspace=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("PREFLIGHT=workspace_trust_required", result.stderr)
+            self.assertFalse((run_dir / ".monju-started").exists())
+            self.assertFalse(
+                (run_dir / f"{run_dir.name}-manifest.json").exists()
+            )
 
     def test_second_launch_cannot_replace_claimed_review_brief(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -777,8 +1018,10 @@ class RunnerTestCase(unittest.TestCase):
                 {
                     "AGENT_CLI_CREDENTIAL_STORE": "file",
                     "FAKE_AGENT_SLEEP": "20",
+                    "HOME": str(self.test_home),
                 }
             )
+            self.trust_workspace(workspace, self.test_home)
             proc = subprocess.Popen(
                 [
                     sys.executable,

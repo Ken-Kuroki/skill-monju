@@ -15,7 +15,47 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
    write a self-contained brief without including Codex's conclusions.
 2. Resolve this skill directory as `<monju-skill-dir>` and the default output root
    as `<absolute-workspace>/monju-reviews`.
-3. Prepare a unique run directory:
+3. Run the deterministic preflight before creating a run:
+
+   ```bash
+   AGENT_CLI_CREDENTIAL_STORE=file \
+   uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
+     --preflight \
+     --workspace "<absolute-workspace>"
+   ```
+
+4. Handle preflight failures without weakening Cursor protections:
+   - For `PREFLIGHT=cursor_state_unwritable`, request platform approval to rerun
+     the preflight outside the filesystem sandbox. Use the same outside-sandbox
+     execution for the eventual `--background` launch. Do not wait for Cursor to
+     fail with `EPERM` under `~/.cursor/projects`.
+   - For `PREFLIGHT=workspace_trust_required`, do not ask the user to open a
+     terminal. Request narrowly scoped platform approval to run this exact
+     command outside the filesystem sandbox with a PTY:
+
+     ```bash
+     AGENT_CLI_CREDENTIAL_STORE=file \
+     agent --workspace "<absolute-workspace>" --trust
+     ```
+
+     State in the approval reason that this persistently trusts exactly the
+     displayed workspace in Cursor. Do not request a reusable broad command
+     approval. Once the Cursor Agent reaches its initial prompt, interrupt and
+     close that process without submitting a prompt, then rerun the preflight
+     outside the sandbox. If trust is still absent, report the command output and
+     stop instead of retrying indefinitely. Never suggest `--yolo` or `--force`,
+     and never create or edit Cursor's trust marker directly.
+   - If authentication fails, stop and ask the user to run this command and
+     complete browser authentication:
+
+     ```bash
+     AGENT_CLI_CREDENTIAL_STORE=file agent login
+     ```
+
+     Never request or handle the user's password. Rerun the preflight after the
+     user confirms.
+
+5. Prepare a unique run directory after `PREFLIGHT=ok`:
 
    ```bash
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
@@ -24,29 +64,15 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
      --output-root "<absolute-output-root>"
    ```
 
-4. Write the brief to the exact `PROMPT_FILE` printed by the command. Keep it
+6. Write the brief to the exact `PROMPT_FILE` printed by the command. Keep it
    inside that run directory. Include the objective, review type, exact scope,
    requirements, constraints, criteria, exclusions, and required questions.
    Include the actual support matrix and risk tolerance when known; do not imply
    enterprise-scale, safety-critical, or speculative future requirements.
    Exclude `monju-reviews/` and the current run's generated artifacts from the
    reviewers' inspection scope.
-5. Check the non-Keychain credential store:
-
-   ```bash
-   AGENT_CLI_CREDENTIAL_STORE=file agent status
-   ```
-
-   If it is not logged in, stop and ask the user to run this command themselves
-   and complete browser authentication:
-
-   ```bash
-   AGENT_CLI_CREDENTIAL_STORE=file agent login
-   ```
-
-   Never request or handle the user's password. Resume after the user confirms
-   authentication.
-6. Start the run using the `RUN_DIR` and `PROMPT_FILE` from step 3:
+7. Start the run using the `RUN_DIR` and `PROMPT_FILE` from step 5. If step 4
+   required outside-sandbox execution, request or reuse that approval here:
 
    ```bash
    AGENT_CLI_CREDENTIAL_STORE=file \
@@ -58,12 +84,20 @@ the launch turn. Inspect and aggregate results only in a later conversation turn
      --prompt-file "<absolute-prompt-file>"
    ```
 
-7. Do not ask for an extra review confirmation. Invoking this skill authorizes
+8. Do not ask for an extra review confirmation. Invoking this skill authorizes
    the read-only review and creation of generated artifacts under the output
    directory; still respect any platform-enforced approval.
-8. End the turn as soon as the runner prints `STATUS=running`. Report the saved
-   run directory and tell the user that results should be checked in a later
-   turn. Do not poll, wait, read intermediate streams, or start another run.
+9. Interpret the short startup result, then end the turn:
+   - `STATUS=running` with `STARTUP=confirmed` means all three reviewers emitted
+     verified model initialization events.
+   - `STATUS=running` with `STARTUP=pending` means the supervisor is alive but
+     initialization was not confirmed within the short grace period; report that
+     distinction without polling.
+   - A terminal `STATUS` with `STARTUP=failed` is an immediate launch failure, not
+     a successful background start. Report it and the saved run directory.
+
+   Never wait for review completion, read intermediate streams, or start another
+   run in the launch turn.
 
 ## Result-check turn
 
@@ -142,6 +176,12 @@ model is unavailable, preserve that failure without substitution.
   maximum theoretical robustness.
 - Verify the `system/init` model against the normalized allowlist of observed
   maximum-quality model IDs and display names. Fail visibly on any unknown name.
+- Before launch, probe actual write access to the relevant Cursor project state
+  directory, verify the workspace-specific trust marker, and check file-store
+  authentication. On an untrusted workspace, let Codex run Cursor's dedicated
+  `--trust` operation through a narrowly approved outside-sandbox PTY; do not
+  require the user to open a terminal. Never bypass trust with `--yolo` or
+  `--force` or by editing the marker directly.
 - Treat WSL2 as the supported Windows execution path; it uses Linux/POSIX
   behavior. Prefer the WSL Linux filesystem for the workspace and output root,
   and prefer a webhook when completion must be visible outside the WSL session.
@@ -170,6 +210,7 @@ model is unavailable, preserve that failure without substitution.
 ## Runner commands
 
 ```text
+--preflight             Check Cursor state access, workspace trust, and authentication
 --prepare               Create a unique run directory and empty brief
 --background            Start the detached supervisor and return immediately
 --status                Read run status without waiting

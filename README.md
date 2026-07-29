@@ -206,10 +206,36 @@ disagreements, and unexecuted experiment proposals.
 
 ### Direct runner invocation
 
-Codex normally invokes the runner automatically. A manual asynchronous run has
-three steps.
+Codex normally invokes the runner automatically. A manual asynchronous run
+starts with a preflight:
 
-First, allocate the run directory:
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file \
+uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+  --preflight \
+  --workspace "/absolute/path/to/workspace"
+```
+
+The preflight performs an actual create-and-delete write probe in the relevant
+`~/.cursor/projects` directory, verifies the workspace-specific trust marker,
+and checks file-store authentication. If it reports
+`PREFLIGHT=cursor_state_unwritable`, rerun both preflight and launch outside the
+filesystem sandbox. If it reports `PREFLIGHT=workspace_trust_required`, Codex
+requests narrowly scoped approval and runs the following command outside the
+sandbox with a PTY:
+
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file \
+agent --workspace "/absolute/path/to/workspace" --trust
+```
+
+The user does not need to open a terminal. Once Cursor reaches its initial
+prompt, Codex interrupts it without submitting a prompt and reruns preflight.
+The approval must name the exact workspace being persistently trusted. Do not
+use `--yolo` or `--force`, request a broad reusable approval, or edit Cursor's
+trust marker directly.
+
+After `PREFLIGHT=ok`, allocate the run directory:
 
 ```bash
 uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
@@ -230,6 +256,12 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
   --prompt-file "/absolute/path/from/PROMPT_FILE"
 ```
 
+The launcher waits only for a short startup grace period. `STARTUP=confirmed`
+means all three requested models emitted verified initialization events.
+`STARTUP=pending` means the detached supervisor is alive but initialization was
+not yet confirmed. A terminal `STATUS` with `STARTUP=failed` means the reviewers
+failed immediately and must not be treated as a successful background launch.
+
 Check it later without waiting:
 
 ```bash
@@ -244,6 +276,7 @@ recorded supervisor process no longer exists.
 Runner options:
 
 ```text
+--preflight             Check Cursor state access, workspace trust, and authentication
 --prepare               Create a unique run directory and empty brief
 --background            Start the detached supervisor and return immediately
 --status                Read current status without waiting
@@ -352,13 +385,17 @@ Cursor CLI cleanup. If publishing fails, the manifest records
 
 For troubleshooting:
 
-1. Check `AGENT_CLI_CREDENTIAL_STORE=file agent status` and run the matching
+1. Run `--preflight`. If Cursor state is unwritable, obtain sandbox approval
+   before launch. If workspace trust is missing, have Codex run
+   `agent --workspace <path> --trust` with a PTY under a narrowly scoped
+   outside-sandbox approval, then rerun preflight.
+2. Check `AGENT_CLI_CREDENTIAL_STORE=file agent status` and run the matching
    `agent login` command if necessary.
-2. Check account-visible models with
+3. Check account-visible models with
    `AGENT_CLI_CREDENTIAL_STORE=file agent models`.
-3. Open `<run-id>-manifest.json` for the overall status and requested/reported
+4. Open `<run-id>-manifest.json` for the overall status and requested/reported
    model names.
-4. Inspect the affected reviewer's `*.stderr.log` and `*.events.jsonl`.
+5. Inspect the affected reviewer's `*.stderr.log` and `*.events.jsonl`.
 
 ## 日本語
 
@@ -553,9 +590,34 @@ Codexは一意な実行フォルダ内にタスク専用のレビュー指示を
 
 ### ランナーの直接実行
 
-通常はCodexが自動的に実行します。手動で非同期実行する場合は3段階です。
+通常はCodexが自動的に実行します。手動で非同期実行する場合は、最初にpreflight
+を実行します。
 
-最初に実行フォルダを確保します。
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file \
+uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+  --preflight \
+  --workspace "/absolute/path/to/workspace"
+```
+
+preflightは、該当する`~/.cursor/projects`内で一時ファイルを作成・削除して実際の
+書き込み可否を確認し、workspace固有のtrust markerとファイル認証を検証します。
+`PREFLIGHT=cursor_state_unwritable`の場合は、preflightと起動の両方をfilesystem
+sandbox外で再実行してください。`PREFLIGHT=workspace_trust_required`の場合は、
+Codexが対象workspaceを明記した限定的な実行承認を要求し、次のコマンドをPTY付きで
+sandbox外実行します。
+
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file \
+agent --workspace "/absolute/path/to/workspace" --trust
+```
+
+ユーザーがターミナルを開く必要はありません。Cursor Agentが最初のプロンプトまで
+到達したら、Codexはプロンプトを送信せずにプロセスを終了し、preflightを再実行
+します。承認理由には、永続的にtrust登録するworkspaceの絶対パスを明記します。
+`--yolo`や`--force`、広範な再利用可能承認、trust markerの直接編集は使いません。
+
+`PREFLIGHT=ok`の後に実行フォルダを確保します。
 
 ```bash
 uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
@@ -576,6 +638,12 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
   --prompt-file "/PROMPT_FILEで表示された絶対パス"
 ```
 
+ランチャーは短いstartup猶予時間だけ待ちます。`STARTUP=confirmed`は、3モデル
+すべての検証済み初期化イベントを確認したことを示します。`STARTUP=pending`は
+監督プロセスが動作中でも初期化確認が間に合わなかった状態です。終端`STATUS`と
+`STARTUP=failed`が返った場合は即時失敗であり、正常なバックグラウンド起動
+として扱いません。
+
 後から、待機せず状態を確認します。
 
 ```bash
@@ -590,6 +658,7 @@ uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
 ランナーのオプション:
 
 ```text
+--preflight             Cursor状態領域、workspace trust、認証を確認
 --prepare               一意な実行フォルダと空のbriefを作成
 --background            監督プロセスを切り離して即座に戻る
 --status                待機せず現在の状態を表示
@@ -696,8 +765,11 @@ effortのWindowsネイティブ経路では直接のCursorプロセスだけを�
 
 トラブルシューティング:
 
-1. `AGENT_CLI_CREDENTIAL_STORE=file agent status`を確認し、必要なら同じ
+1. `--preflight`を実行します。Cursor状態領域へ書き込めない場合はsandbox外実行
+   の承認を得ます。trust未登録の場合は、Codexが限定的なsandbox外実行承認の下で
+   `agent --workspace <path> --trust`をPTY付きで実行し、preflightを再実行します。
+2. `AGENT_CLI_CREDENTIAL_STORE=file agent status`を確認し、必要なら同じ
    環境変数を付けた`agent login`を実行します。
-2. `AGENT_CLI_CREDENTIAL_STORE=file agent models`で利用可能モデルを確認します。
-3. `<run-id>-manifest.json`で全体状態と要求・報告されたモデル名を確認します。
-4. 該当レビュワーの`*.stderr.log`と`*.events.jsonl`を確認します。
+3. `AGENT_CLI_CREDENTIAL_STORE=file agent models`で利用可能モデルを確認します。
+4. `<run-id>-manifest.json`で全体状態と要求・報告されたモデル名を確認します。
+5. 該当レビュワーの`*.stderr.log`と`*.events.jsonl`を確認します。
