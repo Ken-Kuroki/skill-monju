@@ -12,17 +12,19 @@ a later conversation turn.
 
 ## Authorization semantics
 
-Treat an explicit invocation of this skill as authorization to run the scoped
-read-only review, perform its preflight, create private review artifacts, and,
-when required, register Cursor Workspace Trust for the exact requested workspace
-with `--trust`. Never ask for a conversational confirmation such as "Should I
-proceed?" before taking those actions.
+Monju may send the review brief and target-file contents read by reviewers to
+external Cursor/LLM services. Treat an explicit invocation as authorization for
+this scoped read-only workflow, its preflight and private artifacts, and, when
+required, Cursor Workspace Trust for the exact workspace with `--trust`. This
+authorization does not override Codex platform or Auto-review policy. Never ask
+for a conversational confirmation such as "Should I proceed?" before taking
+those actions.
 
 If filesystem sandbox escalation is required, submit the tool call immediately
-with a precise platform approval request. Let the platform approval UI handle
-that decision; do not precede it with a chat question or consume a separate turn.
-Stop only when the user must actually provide missing information or complete an
-action, such as browser authentication or SSO.
+with a precise platform approval request. Let the configured platform approval
+path handle that decision; do not precede it with a chat question or consume a
+separate turn. Stop only when the user must actually provide missing information
+or complete an action, such as browser authentication or SSO.
 
 ## Launch turn
 
@@ -42,9 +44,9 @@ action, such as browser authentication or SSO.
 4. Handle preflight failures without weakening Cursor protections:
    - For `PREFLIGHT=cursor_state_unwritable`, immediately submit an escalated
      tool call to rerun the preflight outside the filesystem sandbox. Do not ask
-     for permission in chat first; the platform approval UI is the approval
-     step. Use the same outside-sandbox execution for the eventual foreground
-     launch. Do not wait for Cursor to fail with `EPERM` under
+     for permission in chat first; the configured platform approval path is the
+     only approval step. Use the same outside-sandbox execution for the eventual
+     foreground launch. Do not wait for Cursor to fail with `EPERM` under
      `~/.cursor/projects`.
    - For `PREFLIGHT=workspace_trust_required`, do not ask the user to open a
      terminal or ask for conversational confirmation. The skill invocation
@@ -111,13 +113,56 @@ action, such as browser authentication or SSO.
    `--background`, or send the supervisor into another process tree. If unified
    exec cannot retain a live session, stop instead of using a detach fallback.
 8. Do not ask for an extra review confirmation at any point in this workflow.
-   A platform-enforced approval popup is expected when escalation is necessary,
+   A platform-enforced approval may surface to the user or go to Auto-review,
    but it must not be preceded by a conversational yes/no question.
 9. If the command yields with a live exec session and prints `STATUS=running` plus
    `EXECUTION_MODE=foreground_supervisor`, report the saved run directory and
    end the turn. Do not call `write_stdin`, poll the session, read intermediate
    streams, or start another run. If the command exits during the initial yield,
    report its terminal status as an immediate launch result instead.
+
+## Auto-review denial
+
+Do not preemptively stop merely because `approvals_reviewer` is `auto_review` or
+its legacy alias `guardian_subagent`; public or sanitized material may pass.
+Proceed to one normal platform approval attempt. If that attempt explicitly
+denies the launch as private-data export to an untrusted external destination:
+
+- Treat it as a Codex platform denial, not an authentication, network, trust,
+  subscription, or model failure. If the launch `exec_command` is denied before
+  process creation, report that no reviewer subprocess started and no review
+  content was sent to Cursor/LLM services.
+- Do not infer an administrator-managed policy from the phrase `tenant policy`;
+  the default generic Auto-review policy can also deny this on personal accounts.
+- Do not retry in the same turn, route around the denial, use indirect execution,
+  or edit configuration automatically. Conversational reapproval can still meet
+  an absolute deny, so do not repeatedly ask for it.
+- Explain the counterintuitive recovery plainly: **Approve for me** sends the
+  request to Auto-review, whose absolute private-data rule may deny it, while
+  **Ask for approval** keeps the same `workspace-write` sandbox but sends the
+  decision to the user. The apparently stricter, more interactive setting can
+  therefore succeed. This changes who approves, not the sandbox protection.
+  Offer this configuration:
+
+  ```toml
+  approval_policy = "on-request"
+  approvals_reviewer = "user"
+  sandbox_mode = "workspace-write"
+  ```
+
+  In the currently reported App UI, **Ask for approval** maps to `user` and
+  **Approve for me** maps to `auto_review`; verify current UI/documentation
+  before stating that mapping because labels may change. After changing it,
+  restart the Codex App and start a new thread/session; do not assume an existing
+  thread inherited the change.
+- If diagnosis is needed, inspect only `approval_policy`, `approvals_reviewer`,
+  `sandbox_mode`, and `[auto_review]` read-only; never display a potentially
+  secret-bearing `config.toml` in full. If the value returns to
+  `guardian_subagent`, describe Desktop write-back only as a possibility. Record
+  the App/CLI version, those keys before and after, and the file modification
+  time, then report it to the applicable known issue or support.
+- Never recommend `danger-full-access`, `--yolo`, or
+  `approval_policy = "never"` as the standard fix.
 
 ## Result-check turn
 
