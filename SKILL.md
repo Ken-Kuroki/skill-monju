@@ -24,6 +24,12 @@ information or complete OpenCode authentication.
 
 ## Launch turn
 
+Treat a default four-reviewer run at the shipped highest reasoning variants as
+likely to consume roughly an entire five-hour OpenCode Go usage allowance in a
+single launch. Tell the user this before launching when it is not already clear,
+but do not turn the warning into an extra confirmation step. Reduce the entries
+in `reviewers.json` first when conserving allowance matters.
+
 1. Identify the workspace and exact review scope. Read enough source material to
    write a self-contained neutral brief without including Codex's conclusions.
 2. Resolve this skill directory as `<monju-skill-dir>` and use
@@ -207,7 +213,6 @@ uses:
 Kimi K3:          opencode-go/kimi-k3 / max
 Grok 4.5:         opencode-go/grok-4.5 / high
 DeepSeek V4 Flash: opencode-go/deepseek-v4-flash / max
-GLM 5.2:          opencode-go/glm-5.2 / max
 Qwen3.8 Max:      opencode-go/qwen3.8-max / max
 ```
 

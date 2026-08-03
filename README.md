@@ -11,12 +11,17 @@ The default reviewers are:
 | Kimi K3 | `opencode-go/kimi-k3` | `max` |
 | Grok 4.5 | `opencode-go/grok-4.5` | `high` |
 | DeepSeek V4 Flash | `opencode-go/deepseek-v4-flash` | `max` |
-| GLM 5.2 | `opencode-go/glm-5.2` | `max` |
 | Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
 Grok 4.5 uses `high`, its highest catalogued variant; the other shipped reviewers
 use `max`. Reviewer count, models, and variants are controlled by
 [`reviewers.json`](reviewers.json) rather than fixed in the runner.
+
+> **Usage warning:** A run with the four default reviewers at these highest
+> reasoning variants can consume roughly an entire five-hour OpenCode Go usage
+> allowance in one launch. This refers to service allowance, not five hours of
+> elapsed wall-clock time. Reduce the entries in `reviewers.json` when conserving
+> allowance matters.
 
 ## Safety model
 
@@ -339,63 +344,230 @@ solution.
 # 日本語
 
 Monjuは、同じneutral briefを設定済みのOpenCode Goモデルへ並列送信し、各レビューと
-終端manifestを非公開成果物として保存します。既定はKimi K3 `max`、Grok 4.5
-`high`、DeepSeek V4 Flash `max`、GLM 5.2 `max`、Qwen3.8 Max `max`です。
-Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの既定reviewerは
-`max`を使います。
+終端manifestを非公開成果物として保存し、別の会話ターンでCodexが結果を集約できる
+ようにします。
 
-reviewer数とmodelは`reviewers.json`の配列だけで変更できます。preflightは認証済み
-catalogでmodelとvariantを検証し、代替modelや推論レベルの低下は行いません。
+既定のレビュアーは次の4件です。
+
+| レビュアー | OpenCode Goモデル | 推論variant |
+|---|---|---|
+| Kimi K3 | `opencode-go/kimi-k3` | `max` |
+| Grok 4.5 | `opencode-go/grok-4.5` | `high` |
+| DeepSeek V4 Flash | `opencode-go/deepseek-v4-flash` | `max` |
+| Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
+
+Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの既定レビュアーは
+`max`を使います。レビュアー数、モデル、variantはrunnerには固定せず、
+[`reviewers.json`](reviewers.json)で管理します。
+
+> **利用量の注意:** 既定の4レビュアーを上記の最高推論variantで動かすと、OpenCode
+> Goの5時間利用枠を1回の実行でほぼ使い切る可能性があります。レビューの実時間が
+> 5時間という意味ではありません。利用枠を節約したい場合は、実行前に
+> `reviewers.json`のレビュアー数を減らしてください。
+
+## 安全性
+
+- 全レビュアーにstdin経由で同じ実効promptを渡します。
+- OpenCodeは`--pure`で実行し、`--auto`は使いません。Monju専用agentは既定ですべての
+  toolを拒否し、read、glob、grepだけを許可します。
+- 通常ファイルのreadを許可した後で`.env`と`.env.*`を明示的に拒否し、
+  `.env.example`だけを再許可します。
+- レビュアーはファイル編集、shell command、web tool、subagent委譲を実行できません。
+  promptでも同じ制約を伝えます。
+- raw streamは公開までowner-onlyの一時stagingへ保持します。
+- レビュアー環境から`MONJU_NOTIFY_WEBHOOK_URL`を除去します。
+- モデル、variant、自動routingの代替は行いません。
+
+Monjuはbriefと、レビュアーが読む対象ファイルの内容をOpenCode Goや外部LLM
+サービスへ送信することがあります。明示的なMonju呼び出しは、この範囲のread-only
+処理を承認しますが、Codex platform側のapproval policyを上書きしません。
+
+## 動作要件
+
+- Python 3.11以降。Pythonの実行には`uv`を使います。
+- tmux。run IDと同名のsessionがforeground supervisorを永続的に所有します。
+- OpenCode CLI。まず`PATH`を確認し、見つからなければ公式installerの
+  `~/.opencode/bin/opencode`を使います。
+- 認証済みのOpenCode Goアカウント：
+
+  ```bash
+  opencode auth login --provider opencode-go
+  ```
+
+- `reviewers.json`に記載した各モデルとvariantの利用権。
+- process group制御を利用できるPOSIX環境またはWSL2。native Windowsはbest effortです。
+
+OpenCodeはversion確認やmodel一覧取得だけでも`~/.local/share/opencode`と
+`~/.cache/opencode`へ書き込みます。sandbox内のcoding agentから実行する場合、
+preflightとreview起動にsandbox外実行のapprovalが必要になることがあります。
+
+## インストール
+
+Codexからskillとして使う場合は、シンボリックリンクでインストールします。
+
+```bash
+./install.sh --agent codex
+```
+
+installerはskill hostとして`cursor`と`claude`にも対応しています。Cursor向けに
+インストールしてもreview backendは変わらず、レビュアーはOpenCode Go経由で動きます。
+
+```bash
+./install.sh --list
+./install.sh --agent all
+./install.sh --agent cursor --scope project --project /path/to/repo
+./install.sh --agent codex --uninstall
+```
+
+## レビュアー設定
+
+同梱する設定は次の形式です。
+
+```json
+{
+  "schema_version": 1,
+  "provider": "opencode-go",
+  "reviewers": [
+    {
+      "key": "kimi-k3",
+      "display_name": "Kimi K3",
+      "model_id": "opencode-go/kimi-k3",
+      "variant": "max"
+    }
+  ]
+}
+```
+
+配列要素の追加と削除でレビュアー数を変更できます。`key`には重複しない安全なslugを
+指定してください。同じモデルとvariantの組み合わせは拒否します。providerは
+`opencode-go/...`だけを受け付け、選択可能なvariantがないモデルに限り`variant`を
+省略できます。
+
+preflightは認証済みcatalogを次のcommandで取得します。
+
+```bash
+opencode models opencode-go --verbose
+```
+
+存在しない、無効、または未知のモデルとvariantは拒否し、品質を自動的に下げません。
 
 ## 実行手順
 
+### 1. Preflight
+
 ```bash
-uv run --script scripts/run_monju.py --preflight --workspace /absolute/workspace
-uv run --script scripts/run_monju.py --prepare --workspace /absolute/workspace
+uv run --script scripts/run_monju.py \
+  --preflight \
+  --workspace /absolute/path/to/workspace
+```
+
+preflightでは次を確認します。
+
+- tmux executableとuser-owned tmux server socketへのaccess
+- OpenCode data/cache directoryへの実際の書き込み可否
+- OpenCode Go credential
+- 現在のverbose catalogにある全設定モデルとvariant
+
+主な結果は次のとおりです。
+
+- `PREFLIGHT=ok`
+- `PREFLIGHT=tmux_state_unwritable`: preflightとlaunchを同じsandbox外approvalで再実行
+- `PREFLIGHT=opencode_state_unwritable`: 対象を限定したsandbox外approvalで再実行
+- `PREFLIGHT=opencode_auth_required`: OpenCode Goへloginしてから再実行
+- `PREFLIGHT=reviewer_model_invalid`: `reviewers.json`を修正し、代替モデルは使わない
+
+`TMUX_SERVER=existing`は既存のuser tmux serverがrunを所有することを示します。
+`TMUX_SERVER=absent`も正常であり、`--tmux`がreview sessionとともにserverを起動します。
+
+OpenCodeはCursor Workspace Trustを使いません。MonjuはOpenCodeのcredentialや設定を
+自動編集しません。
+
+### 2. Run directoryとbriefの準備
+
+```bash
+uv run --script scripts/run_monju.py \
+  --prepare \
+  --workspace /absolute/path/to/workspace \
+  --output-root /absolute/path/to/workspace/monju-reviews
+```
+
+commandは衝突しない`RUN_DIR`と`PROMPT_FILE`を出力します。そのファイルへscope、要件、
+制約、除外事項、risk tolerance、具体的な質問を含むneutral briefを1つ書きます。
+review対象から`monju-reviews/`を除外してください。
+
+### 3. 起動
+
+```bash
 uv run --script scripts/run_monju.py \
   --tmux \
   --notify auto \
-  --workspace /absolute/workspace \
-  --run-dir /absolute/run \
-  --prompt-file /absolute/run/monju-...-00-review-brief.md
+  --workspace /absolute/path/to/workspace \
+  --run-dir /absolute/path/to/run \
+  --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
 
-OpenCodeは`~/.local/share/opencode`と`~/.cache/opencode`へ書き込むため、sandbox外
-実行のplatform approvalが必要になる場合があります。認証がなければ次をユーザー
-自身が実行します。
+runnerはrun IDと同名のtmux sessionを作り、shellを介さずにsupervisorをforeground
+commandとして起動します。commandを別のtmuxで包んだり、`&`、`nohup`、`setsid`、
+`--background`を使ったりしません。launcherが次を返したらpollingせず、その会話
+ターンを終了します。
+
+```text
+STATUS=running
+EXECUTION_MODE=tmux_supervisor
+TMUX_SESSION=<run-id>
+TMUX_SESSION_ALIVE=yes
+```
+
+`STATUS=tmux_starting`も非終端状態なので、別ターンで一度だけ確認します。supervisorは
+約30秒ごとに次のheartbeatをowner-only runner logへflushします。
+
+```text
+MONJU_HEARTBEAT run_id=<run-id> elapsed_seconds=<n>
+```
+
+heartbeatはrunner内部の生存診断です。tmuxによりCodex exec-sessionの寿命からは
+独立しますが、tmux server、host、user session自体の終了までは防げません。
+
+### 4. 別ターンで状態確認
 
 ```bash
-opencode auth login --provider opencode-go
+uv run --script scripts/run_monju.py \
+  --status \
+  --run-dir /absolute/path/to/run
 ```
 
-runnerはrun IDと同名のtmux sessionを作り、その中でsupervisorをforegroundのまま
-維持します。commandを別のtmuxで包んだり、`&`、`nohup`、`setsid`、`--background`
-を使ったりしません。`STATUS=running`、`EXECUTION_MODE=tmux_supervisor`、
-`TMUX_SESSION_ALIVE=yes`を確認したらpollingせず、そのターンを終了します。
-`tmux_starting`も非終端状態です。約30秒ごとのheartbeatはowner-only runner logへ
-出力されます。Codexのexec-session寿命からは独立しますが、tmux server、host、
-user sessionの終了までは防げません。
+`--status`はread-onlyであり、自動pollingや自動recoverを行いません。生存中のtmux run
+では`TMUX_SESSION_ALIVE=yes`を返します。終端状態ならmanifestと生成済みの全review
+Markdownを読みます。
 
-別ターンで一度だけ確認します。
+manifestが`running`のままsupervisorが消失した場合は、`stale_running`とstagingの
+診断情報に加えて次を返します。
+
+```text
+RECOVERY=ready|not_ready|invalid
+RECOVERY_CAN_PUBLISH=yes|no
+```
+
+### 5. 完了済み孤立workerのrecover
+
+全レビュアーの検証済みterminal sidecarが揃い、`RECOVERY_CAN_PUBLISH=yes`の場合だけ
+実行します。
 
 ```bash
-uv run --script scripts/run_monju.py --status --run-dir /absolute/run
+uv run --script scripts/run_monju.py \
+  --recover \
+  --run-dir /absolute/path/to/run
 ```
 
-`stale_running`、`artifact_failure`、または`supervisor_failure`で全reviewerの
-terminal sidecarが揃い、`RECOVERY_CAN_PUBLISH=yes`の場合だけ次を一度実行できます。
+各workerはOpenCode終了後、モデルとvariant、終了状態、時刻、event/stderr artifactの
+sizeとSHA-256を含むterminal sidecarをatomicに書き込みます。recoverはそれらを起動時の
+schema-v3 running manifestと照合します。
 
-```bash
-uv run --script scripts/run_monju.py --recover --run-dir /absolute/run
-```
-
-recoverはOpenCodeや外部LLMを呼ばず、起動時に固定したreviewer設定、sidecar、raw
-artifactのhashだけを検証します。不足時は`not_ready`、破損や不一致は`invalid`とし、
-stagingを保持してmodelの自動retryはしません。publicationまたはsupervisorだけが
-失敗した場合は、同じ検証を通して保存済みstagingの公開を再試行できます。
-
-`--status`はtmux runについて正確なsession名の生存も確認します。sessionが生存中は
-recoverを拒否し、PIDだけを根拠に別プロセスをMonju supervisorとは判断しません。
+recoverはOpenCodeや外部LLMを呼ばず、モデル変更やretryも行いません。sidecar不足は
+`not_ready`、破損やhash不一致は公開不能な`invalid`です。全レビュアーが完了していれば、
+検証済みOpenCode errorを通常のpartial/failureとして公開できます。publicationまたは
+supervisorだけが失敗し、有効なstagingが残っている場合は、同じ検証を通して公開を
+再試行できます。すでに終端manifestが公開済みなら、再recoverはread-onlyのno-opです。
 
 exit code 0でtextが存在するだけではreview成功にしません。共通promptで要求した全
 sectionが揃わない進捗文だけの出力はreviewer failureとして扱います。
@@ -403,11 +575,89 @@ sectionが揃わない進捗文だけの出力はreviewer failureとして扱い
 DeepSeek V4 Flashは、中国ホスティングへの明示的opt-inがない場合、再試行不能な
 HTTP 403 `RegionError`を返すことがあります。これは想定内のreviewer failureとして
 記録し、DeepSeekを設定から外さず、ほかの結果を集約します。自動opt-in、retry、
-代替modelへの切り替えは行わず、runは通常どおりpartial/failure扱いです。
+代替モデルへの切り替えは行わず、runは通常どおりpartial/failure扱いです。
 
-レビュワーは`--pure`と既定denyの専用agentで動作し、read/glob/grepだけを許可します。
-`.env`と`.env.*`は拒否し、promptはargvではなくstdinで渡します。`--auto`は使いません。
+schema-v2のCursor終端manifestは`--status`で引き続き読めますが、旧Cursor raw streamは
+OpenCode backendからrecoverできません。
 
-結果集約では、現在の正しさ・security・data loss・明示契約を優先します。早すぎる
+## プロセスの所有関係と成果物
+
+tmux sessionがforeground supervisorを所有し、supervisorがレビュアーごとの内部worker
+process groupを所有します。各workerはOpenCode process groupを所有し、timeoutを適用して
+terminal sidecarを書きます。SIGINT、SIGTERM、またはtmux session終了時のSIGHUPを受けると、
+supervisor、worker、OpenCode childの順に停止します。終端状態に達するとtmux sessionは
+自動的に閉じます。
+
+tmux serverまたはsupervisorが予期せず消失しても、完了済みsidecarがあればrecoverできる
+場合があります。PIDだけをlive tmux jobの識別根拠にせず、statusとrecoverは起動時に固定した
+正確なsession名も確認します。
+
+公開成果物は次の構成です。
+
+```text
+monju-reviews/<run-id>/
+├── <run-id>-00-review-brief.md
+├── <run-id>-00-effective-prompt.md
+├── <run-id>-01-<key>.md
+├── <run-id>-01-<key>.events.jsonl
+├── <run-id>-01-<key>.stderr.log
+├── <run-id>-01-<key>.terminal.json
+└── <run-id>-manifest.json
+```
+
+追加のworker-task診断ファイルが存在する場合があります。event streamとterminal markerは
+診断用であり、集約にはMarkdownを使います。POSIXでは成果物をowner-onlyにし、公開または
+recover失敗時はstagingとpointerを保持します。
+
+## 通知
+
+`--notify auto`は`MONJU_NOTIFY_WEBHOOK_URL`があればwebhookを使い、なければlocal desktop
+通知を試します。既存tmux serverはclientの任意の環境変数を継承しないため、launcherは
+owner-onlyの一時handoff fileで値を渡し、supervisorがpreflight前に読み取って削除します。
+secretをargv、manifest、公開成果物、レビュアー環境、通知本文へ入れません。通知本文は終端status、
+run ID、結果directoryだけです。通知失敗は記録しますがreview statusを変更しません。
+
+recoverはno-networkなので`--notify auto`と`--notify webhook`を拒否します。desktop通知は
+best effortです。
+
+## Auto-reviewによる拒否
+
+Codex Auto-reviewはprivate repositoryから未確認の外部送信先へのdata exportとして、
+会話上で承認済みでもlaunchを拒否することがあります。absolute denyを受けたら再試行や
+迂回実行をしません。**Ask for approval**は`workspace-write`を維持したまま判断をユーザーへ
+送るため成功し得ますが、**Approve for me**はAuto-reviewへ判断を送ります。
+
+推奨設定は次のとおりです。
+
+```toml
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+```
+
+変更後はCodexを再起動し、新しいthreadを開始します。標準解決策として
+`danger-full-access`、`--yolo`、`approval_policy = "never"`を勧めません。
+
+## 結果集約
+
+結果集約では、現在の正しさ、セキュリティ、データ損失、明示された契約を優先します。早すぎる
 一般化、未要求の互換性、過剰な頑健性、低確率で影響の小さいedge caseは削除せず、
 原則`Usually defer (YAGNI)`へ簡潔にまとめます。
+
+## CLI一覧
+
+```text
+--preflight             状態領域、認証、model、variantを確認
+--prepare               一意なrun directoryと空のbriefを作成
+--tmux                  追跡可能なtmux sessionでsupervisorを起動
+--tmux-bin PATH         tmux executable
+--background            拒否される旧option。--tmuxを使用
+--status                待機せず現在状態を読み取り
+--recover               完了済みの保存artifactを検証・公開
+--run-dir PATH          prepare済みrun directory
+--opencode-bin PATH     OpenCode executable
+--reviewers-file PATH   レビュアーJSON設定
+--timeout-seconds N     レビュアーごとのtimeout。既定3600秒
+--notify MODE           none、auto、desktop、webhook
+--dry-run               OpenCodeを起動せずcommandを表示
+```

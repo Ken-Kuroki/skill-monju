@@ -291,7 +291,6 @@ class RunnerTestCase(unittest.TestCase):
                 ("opencode-go/kimi-k3", "max"),
                 ("opencode-go/grok-4.5", "high"),
                 ("opencode-go/deepseek-v4-flash", "max"),
-                ("opencode-go/glm-5.2", "max"),
                 ("opencode-go/qwen3.8-max", "max"),
             ],
         )
@@ -701,7 +700,7 @@ class RunnerTestCase(unittest.TestCase):
             self.assertIn("only available hosted in China", deepseek["error"])
             self.assertEqual(
                 sum(item["status"] == "success" for item in manifest["results"]),
-                4,
+                3,
             )
 
     def test_reviewer_timeout_is_visible(self) -> None:
