@@ -3,11 +3,12 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Run three independent Cursor CLI reviews in parallel."""
+"""Run configurable independent OpenCode Go reviews in parallel."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -35,45 +36,21 @@ class Reviewer:
     key: str
     display_name: str
     model_id: str
-    allowed_reported_models: tuple[str, ...]
+    variant: str | None
 
 
-REVIEWERS = (
-    Reviewer(
-        1,
-        "kimi-k3",
-        "Kimi K3",
-        "kimi-k3-max",
-        ("kimi-k3-max", "Kimi K3 Max"),
-    ),
-    Reviewer(
-        2,
-        "grok-4-5",
-        "Grok 4.5",
-        "cursor-grok-4.5-high",
-        ("cursor-grok-4.5-high", "Cursor Grok 4.5 High"),
-    ),
-    Reviewer(
-        3,
-        "fable-5",
-        "Claude Fable 5",
-        "claude-fable-5-thinking-max",
-        ("claude-fable-5-thinking-max", "Fable 5 300K Max"),
-    ),
-)
-
-REASONING_POLICY = {
-    "mode": "highest-supported-reasoning-only",
-    "kimi_k3": "kimi-k3-max",
-    "grok_4_5": "cursor-grok-4.5-high",
-    "claude_fable_5": "claude-fable-5-thinking-max",
-    "fast": False,
-    "parallel_compute_quality_variants": False,
-    "top_level_reviewers": 3,
-}
+REVIEWERS: tuple[Reviewer, ...] = ()
+REVIEWER_CONFIG_HASH = ""
+CATALOG_VERIFICATION: dict[str, Any] = {}
+CONFIG_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 3
+BACKEND = "opencode"
+PROVIDER = "opencode-go"
+MONJU_AGENT_NAME = "monju-review"
+DEFAULT_REVIEWERS_FILE = Path(__file__).resolve().parents[1] / "reviewers.json"
 
 PROMPT_ENVELOPE = """\
-You are one of three independent reviewers in a review-only workflow named Monju.
+You are one independent reviewer in a parallel review-only workflow named Monju.
 
 Mandatory rules:
 1. Do not create, edit, delete, rename, or format any file.
@@ -150,17 +127,27 @@ PRIVATE_DIR_MODE = 0o700
 NOTIFICATION_WEBHOOK_ENV = "MONJU_NOTIFY_WEBHOOK_URL"
 NOTIFICATION_TIMEOUT_SECONDS = 10
 EXECUTION_MODE = "foreground_supervisor"
+TMUX_EXECUTION_MODE = "tmux_supervisor"
+TMUX_STARTUP_TIMEOUT_SECONDS = 20.0
+DEFAULT_TMUX_BIN = "tmux"
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECOVERY_SOURCE = "preserved_event_streams"
-TERMINAL_STATUSES = frozenset(
-    {
-        "success",
-        "partial_failure",
-        "failure",
-        "interrupted",
-        "artifact_failure",
-        "supervisor_failure",
-    }
+TERMINAL_MARKER_SCHEMA_VERSION = 1
+PUBLISHED_STATUSES = frozenset(
+    {"success", "partial_failure", "failure", "interrupted"}
+)
+RECOVERABLE_FAILURE_STATUSES = frozenset(
+    {"artifact_failure", "supervisor_failure"}
+)
+TERMINAL_STATUSES = PUBLISHED_STATUSES | RECOVERABLE_FAILURE_STATUSES
+REQUIRED_REVIEW_HEADINGS = (
+    "# Verdict",
+    "# Findings",
+    "## Act now",
+    "## Usually defer (YAGNI)",
+    "# Gaps and uncertainties",
+    "# Proposed experiments",
+    "# Recommended next actions",
 )
 IGNORED_STARTUP_STDERR_FRAGMENTS = (
     "warning: setlocale: LC_ALL: cannot change locale",
@@ -171,8 +158,10 @@ IGNORED_STARTUP_STDERR_FRAGMENTS = (
 class ReviewResult:
     reviewer: str
     requested_model: str
+    requested_variant: str | None
     reported_model: str | None
     model_verified: bool
+    model_verification_source: str
     session_id: str | None
     status: str
     exit_code: int | None
@@ -193,16 +182,13 @@ class ReviewResult:
 
 @dataclass(frozen=True)
 class ParsedEventStream:
-    reported_model: str | None
     session_id: str | None
     final_text: str | None
     stream_error: str | None
     warnings: tuple[str, ...]
     malformed_lines: tuple[int, ...]
     event_count: int
-    terminal_result_count: int
-    terminal_result_is_last: bool
-    terminal_duration_seconds: float | None
+    text_event_count: int
 
 
 @dataclass(frozen=True)
@@ -210,7 +196,9 @@ class RecoveryStream:
     reviewer: Reviewer
     events_path: Path
     stderr_path: Path
+    terminal_path: Path
     parsed: ParsedEventStream | None
+    terminal: dict[str, Any] | None
     terminal_complete: bool
     validation_errors: tuple[str, ...]
     read_error: str | None
@@ -237,7 +225,7 @@ class NotificationResult:
 
 
 class RunInterrupted(Exception):
-    """Raised when the foreground review supervisor receives SIGTERM."""
+    """Raised when a Monju process receives a handled termination signal."""
 
     def __init__(self, signum: int):
         super().__init__(f"received signal {signum}")
@@ -298,10 +286,6 @@ class SupervisorHeartbeat:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
-    @property
-    def daemon(self) -> bool:
-        return self._thread.daemon
-
     def start(self) -> SupervisorHeartbeat:
         self._started_at = time.monotonic()
         self._thread.start()
@@ -337,16 +321,24 @@ class SupervisorHeartbeat:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run the same read-only review through Kimi K3, Grok 4.5, "
-            "and Claude Fable 5 in parallel."
-        )
+        description="Run the same read-only review through configured OpenCode Go models."
     )
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--run-dir", type=Path)
-    parser.add_argument("--agent-bin", default="agent")
+    parser.add_argument("--opencode-bin", default="opencode")
+    parser.add_argument(
+        "--tmux-bin",
+        default=DEFAULT_TMUX_BIN,
+        help="tmux executable used by --tmux; defaults to PATH lookup.",
+    )
+    parser.add_argument(
+        "--reviewers-file",
+        type=Path,
+        default=DEFAULT_REVIEWERS_FILE,
+        help="Reviewer configuration JSON; defaults to the skill's reviewers.json.",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument(
         "--notify",
@@ -367,16 +359,21 @@ def parse_args() -> argparse.Namespace:
         "--preflight",
         action="store_true",
         help=(
-            "Check Cursor state access, workspace trust, and authentication "
-            "without starting a review."
+            "Check tmux access plus OpenCode state, authentication, models, "
+            "and variants without starting a review."
         ),
+    )
+    mode.add_argument(
+        "--tmux",
+        action="store_true",
+        help="Launch the foreground supervisor inside a user-owned tmux session.",
     )
     mode.add_argument(
         "--background",
         action="store_true",
         help=(
-            "Deprecated and rejected: run the supervisor in the foreground of a "
-            "Codex background terminal instead."
+            "Deprecated and rejected: use --tmux for a tracked persistent "
+            "supervisor instead."
         ),
     )
     mode.add_argument(
@@ -389,19 +386,130 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Publish a dead supervisor's completed preserved event streams "
-            "without invoking Cursor or using the network."
+            "without invoking OpenCode or using the network."
         ),
     )
     mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print exact reviewer command templates without invoking Cursor.",
+        help="Print exact reviewer command templates without invoking OpenCode.",
     )
+    mode.add_argument("--reviewer-worker", type=Path, help=argparse.SUPPRESS)
+    mode.add_argument("--tmux-supervisor", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--tmux-session", help=argparse.SUPPRESS)
+    parser.add_argument("--tmux-webhook-file", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def iso_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def canonical_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def reviewers_payload(reviewers: tuple[Reviewer, ...]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ordinal": reviewer.ordinal,
+            "key": reviewer.key,
+            "display_name": reviewer.display_name,
+            "model_id": reviewer.model_id,
+            "variant": reviewer.variant,
+        }
+        for reviewer in reviewers
+    ]
+
+
+def reviewer_config_hash(reviewers: tuple[Reviewer, ...]) -> str:
+    payload = {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "provider": PROVIDER,
+        "reviewers": reviewers_payload(reviewers),
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def validate_reviewer_entries(entries: Any) -> tuple[Reviewer, ...]:
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("reviewer configuration must contain at least one reviewer")
+    reviewers: list[Reviewer] = []
+    keys: set[str] = set()
+    model_variants: set[tuple[str, str | None]] = set()
+    for ordinal, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"reviewer {ordinal} must be a JSON object")
+        key = entry.get("key")
+        display_name = entry.get("display_name")
+        model_id = entry.get("model_id")
+        variant = entry.get("variant")
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", key):
+            raise ValueError(f"reviewer {ordinal} has an invalid key")
+        if key in keys:
+            raise ValueError(f"duplicate reviewer key: {key}")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError(f"reviewer {key} has no display_name")
+        if not isinstance(model_id, str) or not model_id.startswith(f"{PROVIDER}/"):
+            raise ValueError(
+                f"reviewer {key} model_id must start with '{PROVIDER}/'"
+            )
+        if variant is not None and (not isinstance(variant, str) or not variant.strip()):
+            raise ValueError(f"reviewer {key} has an invalid variant")
+        identity = (model_id, variant)
+        if identity in model_variants:
+            raise ValueError(f"duplicate model/variant configuration: {model_id}/{variant}")
+        keys.add(key)
+        model_variants.add(identity)
+        reviewers.append(
+            Reviewer(ordinal, key, display_name.strip(), model_id, variant)
+        )
+    return tuple(reviewers)
+
+
+def load_reviewer_configuration(path: Path) -> tuple[tuple[Reviewer, ...], str]:
+    resolved = path.expanduser().resolve()
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"could not read reviewer configuration {resolved}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("reviewer configuration root must be a JSON object")
+    if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
+        raise SystemExit(
+            f"unsupported reviewer configuration schema: {payload.get('schema_version')!r}"
+        )
+    if payload.get("provider") != PROVIDER:
+        raise SystemExit(f"reviewer provider must be '{PROVIDER}'")
+    try:
+        reviewers = validate_reviewer_entries(payload.get("reviewers"))
+    except ValueError as exc:
+        raise SystemExit(f"invalid reviewer configuration: {exc}") from exc
+    return reviewers, reviewer_config_hash(reviewers)
+
+
+def reviewers_from_manifest(payload: dict[str, Any]) -> tuple[Reviewer, ...]:
+    if payload.get("schema_version") != MANIFEST_SCHEMA_VERSION or payload.get("backend") != BACKEND:
+        raise ValueError("manifest does not contain a recoverable OpenCode reviewer configuration")
+    try:
+        reviewers = validate_reviewer_entries(payload.get("reviewers"))
+    except ValueError as exc:
+        raise ValueError(f"invalid manifest reviewer configuration: {exc}") from exc
+    for expected, reviewer in enumerate(reviewers, start=1):
+        raw = payload["reviewers"][expected - 1]
+        if raw.get("ordinal") != reviewer.ordinal:
+            raise ValueError("manifest reviewer ordinals are invalid")
+    expected_hash = payload.get("reviewer_config_sha256")
+    actual_hash = reviewer_config_hash(reviewers)
+    if expected_hash != actual_hash:
+        raise ValueError("manifest reviewer configuration hash does not match")
+    return reviewers
+
+
+def configure_reviewers(reviewers: tuple[Reviewer, ...], config_hash: str) -> None:
+    global REVIEWERS, REVIEWER_CONFIG_HASH
+    REVIEWERS = reviewers
+    REVIEWER_CONFIG_HASH = config_hash
 
 
 def notification_pending(mode: str) -> dict[str, Any]:
@@ -531,13 +639,11 @@ def run_webhook_notification(
         with urllib.request.urlopen(
             request,
             timeout=NOTIFICATION_TIMEOUT_SECONDS,
-        ) as response:
-            status_code = response.getcode()
+        ):
+            pass
     except (OSError, urllib.error.URLError) as exc:
         detail = str(exc).replace(webhook_url, "<redacted-webhook-url>")
         raise RuntimeError(f"webhook request failed: {detail}") from exc
-    if not 200 <= status_code < 300:
-        raise RuntimeError(f"webhook returned HTTP {status_code}")
     return "webhook"
 
 
@@ -674,70 +780,6 @@ def make_run_id() -> str:
     return f"monju-{stamp}-p{os.getpid()}-r{nonce}"
 
 
-def normalize_model_name(value: str) -> str:
-    return "".join(character.lower() for character in value if character.isalnum())
-
-
-def has_forbidden_variant(value: str) -> bool:
-    lowered = value.lower()
-    lowered = re.sub(r"fast\s*[:=]\s*(false|off|0)", "", lowered)
-    normalized = normalize_model_name(lowered)
-    forbidden = (
-        "fast",
-        "ultracode",
-        "mini",
-        "lite",
-        "flash",
-        "turbo",
-        "nano",
-    )
-    if any(token in normalized for token in forbidden):
-        return True
-    raw_tokens = set(re.findall(r"[a-z0-9]+", lowered))
-    return bool(raw_tokens.intersection({"auto", "low", "base"}))
-
-
-def model_matches(reviewer: Reviewer, reported_model: str | None) -> bool:
-    if not reported_model or has_forbidden_variant(reported_model):
-        return False
-    normalized_reported = normalize_model_name(reported_model)
-    allowed = {
-        normalize_model_name(value) for value in reviewer.allowed_reported_models
-    }
-    return normalized_reported in allowed
-
-
-def validate_quality_policy() -> None:
-    if len(REVIEWERS) != 3:
-        raise RuntimeError("Monju must run exactly three top-level reviewers")
-    for reviewer in REVIEWERS:
-        if has_forbidden_variant(reviewer.model_id):
-            raise RuntimeError(
-                f"forbidden speed/parallel-compute variant configured for "
-                f"{reviewer.display_name}: {reviewer.model_id}"
-            )
-        allowed = {
-            normalize_model_name(value)
-            for value in reviewer.allowed_reported_models
-        }
-        if normalize_model_name(reviewer.model_id) not in allowed:
-            raise RuntimeError(
-                f"requested model ID is missing from the reported-model allowlist "
-                f"for {reviewer.display_name}"
-            )
-    expected_specs = {
-        "Kimi K3": "kimi-k3-max",
-        "Grok 4.5": "cursor-grok-4.5-high",
-        "Claude Fable 5": "claude-fable-5-thinking-max",
-    }
-    actual_specs = {reviewer.display_name: reviewer.model_id for reviewer in REVIEWERS}
-    if actual_specs != expected_specs:
-        raise RuntimeError(
-            "maximum-reasoning model specifications changed unexpectedly: "
-            f"{actual_specs}"
-        )
-
-
 def resolve_executable(value: str) -> str:
     expanded = os.path.expanduser(value)
     explicit_path = (
@@ -748,38 +790,139 @@ def resolve_executable(value: str) -> str:
     if explicit_path:
         resolved = Path(expanded).resolve()
         if not resolved.is_file() or not os.access(resolved, os.X_OK):
-            raise FileNotFoundError(f"Cursor CLI is not executable: {resolved}")
+            raise FileNotFoundError(f"OpenCode CLI is not executable: {resolved}")
         return str(resolved)
 
     located = shutil.which(value)
-    if not located:
-        raise FileNotFoundError(
-            f"Cursor CLI executable '{value}' was not found in PATH. "
-            "Install Cursor CLI or pass --agent-bin with an absolute path."
+    if located:
+        return str(Path(located).resolve())
+    if value == "opencode":
+        installer_path = Path.home() / ".opencode" / "bin" / "opencode"
+        if installer_path.is_file() and os.access(installer_path, os.X_OK):
+            return str(installer_path.resolve())
+    raise FileNotFoundError(
+        f"OpenCode CLI executable '{value}' was not found. Install OpenCode or "
+        "pass --opencode-bin with an absolute path."
+    )
+
+
+def resolve_tmux_executable(value: str) -> str:
+    expanded = os.path.expanduser(value)
+    explicit_path = (
+        os.path.isabs(expanded)
+        or expanded.startswith(f".{os.sep}")
+        or os.sep in expanded
+    )
+    if explicit_path:
+        resolved = Path(expanded).resolve()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise FileNotFoundError(f"tmux is not executable: {resolved}")
+        return str(resolved)
+    located = shutil.which(value)
+    if located:
+        return str(Path(located).resolve())
+    raise FileNotFoundError(
+        f"tmux executable '{value}' was not found. Install tmux or pass "
+        "--tmux-bin with an absolute path."
+    )
+
+
+def run_tmux_capture(
+    tmux_bin: str,
+    arguments: list[str],
+    *,
+    timeout: int = 10,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [tmux_bin, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    return str(Path(located).resolve())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not run tmux: {exc}") from exc
 
 
-def build_command(
-    agent_bin: str, reviewer: Reviewer, effective_prompt: str
-) -> list[str]:
-    return [
-        agent_bin,
-        "-p",
-        "--mode=ask",
+def tmux_missing_target(output: str) -> bool:
+    normalized = output.lower()
+    return any(
+        fragment in normalized
+        for fragment in (
+            "can't find session",
+            "no server running",
+            "no sessions",
+            "failed to connect to server",
+        )
+    )
+
+
+def inspect_tmux_server(tmux_bin: str) -> str:
+    result = run_tmux_capture(
+        tmux_bin,
+        ["list-sessions", "-F", "#{session_name}"],
+    )
+    output = strip_ansi(result.stdout).strip()
+    if result.returncode == 0:
+        return "existing"
+    if tmux_missing_target(output):
+        return "absent"
+    if "operation not permitted" in output.lower() or "permission denied" in output.lower():
+        raise SystemExit(
+            "PREFLIGHT=tmux_state_unwritable\n"
+            f"tmux socket access failed: {output or 'permission denied'}\n"
+            "Rerun preflight and launch outside the filesystem sandbox."
+        )
+    raise SystemExit(
+        "PREFLIGHT=tmux_unavailable\n"
+        f"tmux server check failed: {output or f'exit status {result.returncode}'}"
+    )
+
+
+def tmux_session_is_running(tmux_bin: str, session_name: str) -> bool:
+    result = run_tmux_capture(
+        tmux_bin,
+        ["has-session", "-t", f"={session_name}"],
+    )
+    if result.returncode == 0:
+        return True
+    output = strip_ansi(result.stdout).strip()
+    if tmux_missing_target(output):
+        return False
+    raise RuntimeError(
+        f"tmux session check failed: {output or f'exit status {result.returncode}'}"
+    )
+
+
+def build_command(opencode_bin: str, reviewer: Reviewer, workspace: Path) -> list[str]:
+    command = [
+        opencode_bin,
+        "--pure",
+        "run",
+        "--format",
+        "json",
         "--model",
         reviewer.model_id,
-        "--output-format",
-        "stream-json",
-        effective_prompt,
+        "--agent",
+        MONJU_AGENT_NAME,
+        "--dir",
+        str(workspace),
     ]
+    if reviewer.variant is not None:
+        command.extend(["--variant", reviewer.variant])
+    return command
 
 
 def ensure_prompt_size(effective_prompt: str) -> None:
     size = len(effective_prompt.encode("utf-8"))
     if size > MAX_EFFECTIVE_PROMPT_BYTES:
         raise SystemExit(
-            f"effective prompt is {size} bytes; the safe argv limit is "
+            f"effective prompt is {size} bytes; the configured safety limit is "
             f"{MAX_EFFECTIVE_PROMPT_BYTES} bytes. Narrow the review brief."
         )
 
@@ -819,16 +962,13 @@ def terminate_process(proc: subprocess.Popen[bytes]) -> None:
 
 
 def inspect_event_stream(path: Path) -> ParsedEventStream:
-    reported_model: str | None = None
     session_id: str | None = None
-    final_text: str | None = None
+    text_parts: list[str] = []
     stream_error: str | None = None
     warnings: list[str] = []
     malformed_lines: list[int] = []
     event_count = 0
-    terminal_result_count = 0
-    last_event_was_terminal = False
-    terminal_duration_seconds: float | None = None
+    text_event_count = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -842,75 +982,44 @@ def inspect_event_stream(path: Path) -> ParsedEventStream:
                 malformed_lines.append(line_number)
                 continue
             if not isinstance(decoded, dict):
-                warnings.append(
-                    f"non-object event line {line_number}: "
-                    f"{type(decoded).__name__}"
-                )
+                warnings.append(f"non-object event line {line_number}: {type(decoded).__name__}")
                 malformed_lines.append(line_number)
                 continue
             event: dict[str, Any] = decoded
             event_count += 1
-            last_event_was_terminal = False
+            current_session = event.get("sessionID")
+            if isinstance(current_session, str):
+                if session_id is None:
+                    session_id = current_session
+                elif current_session != session_id:
+                    malformed_lines.append(line_number)
+                    warnings.append(f"event line {line_number} changed sessionID")
 
-            if session_id is None and isinstance(event.get("session_id"), str):
-                session_id = event["session_id"]
-
-            if (
-                event.get("type") == "system"
-                and event.get("subtype") == "init"
-                and isinstance(event.get("model"), str)
-            ):
-                reported_model = event["model"]
-
-            if event.get("type") == "result":
-                terminal_result_count += 1
-                last_event_was_terminal = True
-                duration_ms = event.get("duration_ms")
-                if (
-                    isinstance(duration_ms, (int, float))
-                    and not isinstance(duration_ms, bool)
-                    and duration_ms >= 0
-                ):
-                    terminal_duration_seconds = duration_ms / 1000
-                if event.get("is_error"):
-                    stream_error = str(
-                        event.get("result") or "Cursor reported an error"
-                    )
-                elif event.get("subtype") == "success" and isinstance(
-                    event.get("result"), str
-                ):
-                    final_text = event["result"]
-                else:
-                    stream_error = str(
-                        event.get("result") or "Cursor reported an error"
-                    )
+            event_type = event.get("type")
+            if event_type == "text":
+                part = event.get("part")
+                text_value = part.get("text") if isinstance(part, dict) else None
+                if isinstance(text_value, str) and text_value.strip():
+                    text_parts.append(text_value)
+                    text_event_count += 1
+            elif event_type == "error":
+                error = event.get("error")
+                message: Any = None
+                if isinstance(error, dict):
+                    data = error.get("data")
+                    if isinstance(data, dict):
+                        message = data.get("message")
+                    message = message or error.get("message") or error.get("name")
+                stream_error = str(message or "OpenCode reported an error")
 
     return ParsedEventStream(
-        reported_model=reported_model,
         session_id=session_id,
-        final_text=final_text,
+        final_text="\n\n".join(text_parts) if text_parts else None,
         stream_error=stream_error,
         warnings=tuple(warnings),
         malformed_lines=tuple(malformed_lines),
         event_count=event_count,
-        terminal_result_count=terminal_result_count,
-        terminal_result_is_last=(
-            terminal_result_count > 0 and last_event_was_terminal
-        ),
-        terminal_duration_seconds=terminal_duration_seconds,
-    )
-
-
-def parse_event_stream(
-    path: Path,
-) -> tuple[str | None, str | None, str | None, str | None, list[str]]:
-    parsed = inspect_event_stream(path)
-    return (
-        parsed.reported_model,
-        parsed.session_id,
-        parsed.final_text,
-        parsed.stream_error,
-        list(parsed.warnings),
+        text_event_count=text_event_count,
     )
 
 
@@ -922,32 +1031,205 @@ def parsed_review_errors(
     if parsed.malformed_lines:
         lines = ", ".join(str(line) for line in parsed.malformed_lines[:10])
         suffix = "…" if len(parsed.malformed_lines) > 10 else ""
-        errors.append(f"malformed Cursor event stream at line(s) {lines}{suffix}")
-    if parsed.terminal_result_count == 0:
-        errors.append("Cursor emitted no terminal result event")
-    elif parsed.terminal_result_count != 1:
-        errors.append(
-            "Cursor emitted an unexpected number of terminal result events: "
-            f"{parsed.terminal_result_count}"
-        )
-    elif not parsed.terminal_result_is_last:
-        errors.append("Cursor emitted events after its terminal result")
-
-    reported_model = parsed.reported_model
-    if not reported_model:
-        errors.append("Cursor emitted no system/init model")
-    elif has_forbidden_variant(reported_model):
-        errors.append(f"reported a forbidden model variant: '{reported_model}'")
-    elif not model_matches(reviewer, reported_model):
-        errors.append(
-            f"reported model '{reported_model}' does not match the required "
-            f"family and quality for '{reviewer.display_name}'"
-        )
+        errors.append(f"malformed OpenCode event stream at line(s) {lines}{suffix}")
     if not parsed.final_text:
-        errors.append("Cursor emitted no successful final result")
+        errors.append("OpenCode emitted no final review text")
+    else:
+        missing_headings = [
+            heading
+            for heading in REQUIRED_REVIEW_HEADINGS
+            if re.search(
+                rf"(?m)^{re.escape(heading)}[ \t]*$",
+                parsed.final_text,
+            )
+            is None
+        ]
+        if missing_headings:
+            errors.append(
+                "OpenCode review omitted required section(s): "
+                + ", ".join(missing_headings)
+            )
     if parsed.stream_error:
         errors.append(parsed.stream_error)
     return errors
+
+
+def opencode_agent_config() -> dict[str, Any]:
+    return {
+        "agent": {
+            MONJU_AGENT_NAME: {
+                "description": "Read-only Monju reviewer",
+                "mode": "primary",
+                "permission": {
+                    "*": "deny",
+                    "read": {
+                        "*": "allow",
+                        "*.env": "deny",
+                        "*.env.*": "deny",
+                        "*.env.example": "allow",
+                    },
+                    "glob": "allow",
+                    "grep": "allow",
+                },
+            }
+        }
+    }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def terminal_marker_path(staging_dir: Path, run_id: str, reviewer: Reviewer) -> Path:
+    stem = f"{run_id}-{reviewer.ordinal:02d}-{reviewer.key}"
+    return staging_dir / f"{stem}.terminal.json"
+
+
+def catalog_model_verified(reviewer: Reviewer) -> bool:
+    models = CATALOG_VERIFICATION.get("models")
+    if not isinstance(models, dict):
+        return False
+    entry = models.get(reviewer.model_id)
+    if not isinstance(entry, dict):
+        return False
+    variants = entry.get("variants")
+    if reviewer.variant is None:
+        return True
+    return isinstance(variants, list) and reviewer.variant in variants
+
+
+def validate_terminal_marker(
+    marker: Any,
+    reviewer: Reviewer,
+    run_id: str,
+    events_path: Path,
+    stderr_path: Path,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(marker, dict):
+        return ["terminal marker is not a JSON object"]
+    expected = {
+        "schema_version": TERMINAL_MARKER_SCHEMA_VERSION,
+        "run_id": run_id,
+        "ordinal": reviewer.ordinal,
+        "reviewer_key": reviewer.key,
+        "model_id": reviewer.model_id,
+        "variant": reviewer.variant,
+        "reviewer_config_sha256": REVIEWER_CONFIG_HASH,
+    }
+    for key, value in expected.items():
+        if marker.get(key) != value:
+            errors.append(f"terminal marker {key} does not match launch configuration")
+    if marker.get("completed") is not True:
+        errors.append("terminal marker is not complete")
+    for label, path in (("events", events_path), ("stderr", stderr_path)):
+        try:
+            size = path.stat().st_size
+            digest = file_sha256(path)
+        except OSError as exc:
+            errors.append(f"could not verify {label} artifact: {exc}")
+            continue
+        if marker.get(f"{label}_size") != size or marker.get(f"{label}_sha256") != digest:
+            errors.append(f"terminal marker {label} hash or size does not match")
+    return errors
+
+
+def run_reviewer_worker(task_path: Path) -> int:
+    try:
+        task = json.loads(task_path.resolve().read_text(encoding="utf-8"))
+        reviewer = Reviewer(
+            int(task["ordinal"]),
+            str(task["key"]),
+            str(task["display_name"]),
+            str(task["model_id"]),
+            task.get("variant"),
+        )
+        workspace = Path(task["workspace"]).resolve()
+        prompt_path = Path(task["prompt_path"]).resolve()
+        events_path = Path(task["events_path"]).resolve()
+        stderr_path = Path(task["stderr_path"]).resolve()
+        terminal_path = Path(task["terminal_path"]).resolve()
+        opencode_bin = str(task["opencode_bin"])
+        timeout_seconds = int(task["timeout_seconds"])
+        config_hash = str(task["reviewer_config_sha256"])
+        run_id = str(task["run_id"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        print(f"invalid reviewer worker task: {exc}", file=sys.stderr)
+        return 64
+
+    started_at = iso_now()
+    started_monotonic = time.monotonic()
+    exit_code = 127
+    timed_out = False
+    launch_error: str | None = None
+    interrupted_signal: int | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    environment = os.environ.copy()
+    environment.pop(NOTIFICATION_WEBHOOK_ENV, None)
+    environment["OPENCODE_CONFIG_CONTENT"] = canonical_json(opencode_agent_config())
+    environment["OPENCODE_AUTO_SHARE"] = "false"
+
+    def worker_signal(signum: int, _frame: Any) -> None:
+        raise RunInterrupted(signum)
+
+    old_sigterm = signal.signal(signal.SIGTERM, worker_signal)
+    try:
+        prompt = prompt_path.read_bytes()
+        with events_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            try:
+                proc = subprocess.Popen(
+                    build_command(opencode_bin, reviewer, workspace),
+                    cwd=workspace,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+                try:
+                    proc.communicate(input=prompt, timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    terminate_process(proc)
+                exit_code = proc.returncode if proc.returncode is not None else 124
+            except RunInterrupted as exc:
+                interrupted_signal = exc.signum
+                if proc is not None:
+                    terminate_process(proc)
+                exit_code = 128 + exc.signum
+            except OSError as exc:
+                launch_error = f"failed to launch OpenCode CLI: {exc}"
+    finally:
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+    completed_at = iso_now()
+    marker = {
+        "schema_version": TERMINAL_MARKER_SCHEMA_VERSION,
+        "completed": True,
+        "run_id": run_id,
+        "ordinal": reviewer.ordinal,
+        "reviewer_key": reviewer.key,
+        "model_id": reviewer.model_id,
+        "variant": reviewer.variant,
+        "reviewer_config_sha256": config_hash,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "duration_seconds": time.monotonic() - started_monotonic,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "interrupted_signal": interrupted_signal,
+        "launch_error": launch_error,
+        "events_size": events_path.stat().st_size,
+        "events_sha256": file_sha256(events_path),
+        "stderr_size": stderr_path.stat().st_size,
+        "stderr_sha256": file_sha256(stderr_path),
+    }
+    write_json_atomic(terminal_path, marker)
+    return 0
 
 
 def markdown_report(
@@ -967,8 +1249,10 @@ def markdown_report(
         f"# Monju review — {reviewer.display_name}",
         "",
         f"- Requested model: `{result.requested_model}`",
-        f"- Reported model: `{result.reported_model or 'not reported'}`",
+        f"- Requested variant: `{result.requested_variant or 'default'}`",
+        "- Reported model: `not exposed by OpenCode JSON output`",
         f"- Model verified: `{'yes' if result.model_verified else 'no'}`",
+        f"- Verification source: `{result.model_verification_source}`",
         f"- Status: `{result.status}`",
         f"- Session ID: `{result.session_id or 'not reported'}`",
         f"- Started: `{started_at}`",
@@ -998,7 +1282,7 @@ def markdown_report(
             [
                 "## Review unavailable",
                 "",
-                result.error or "Cursor did not emit a final review.",
+                result.error or "OpenCode did not emit a final review.",
                 "",
             ]
         )
@@ -1009,7 +1293,7 @@ def markdown_report(
 
 
 def run_reviewer(
-    agent_bin: str,
+    opencode_bin: str,
     reviewer: Reviewer,
     effective_prompt: str,
     staging_dir: Path,
@@ -1022,73 +1306,98 @@ def run_reviewer(
     events_path = staging_dir / f"{stem}.events.jsonl"
     stderr_path = staging_dir / f"{stem}.stderr.log"
     markdown_path = staging_dir / f"{stem}.md"
-    command = build_command(agent_bin, reviewer, effective_prompt)
-    started_at = iso_now()
-    started_monotonic = time.monotonic()
-    timed_out = False
-    launch_error: str | None = None
-    exit_code = 127
-    reviewer_environment = os.environ.copy()
-    reviewer_environment.pop(NOTIFICATION_WEBHOOK_ENV, None)
-
-    with events_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+    terminal_path = terminal_marker_path(staging_dir, run_id, reviewer)
+    task_path = staging_dir / f"{stem}.worker-task.json"
+    effective_prompt_path = staging_dir / f"{run_id}-00-effective-prompt.md"
+    command = build_command(opencode_bin, reviewer, workspace)
+    write_json_atomic(
+        task_path,
+        {
+            **reviewers_payload((reviewer,))[0],
+            "workspace": str(workspace),
+            "prompt_path": str(effective_prompt_path),
+            "events_path": str(events_path),
+            "stderr_path": str(stderr_path),
+            "terminal_path": str(terminal_path),
+            "opencode_bin": opencode_bin,
+            "timeout_seconds": timeout_seconds,
+            "run_id": run_id,
+            "reviewer_config_sha256": REVIEWER_CONFIG_HASH,
+        },
+    )
+    worker_command = [sys.executable, str(Path(__file__).resolve()), "--reviewer-worker", str(task_path)]
+    worker_exit = 127
+    try:
+        proc = subprocess.Popen(
+            worker_command,
+            cwd=workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        coordinator.register(reviewer.ordinal, proc)
         try:
-            proc = subprocess.Popen(
-                command,
-                cwd=workspace,
-                env=reviewer_environment,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                # Isolate each reviewer only for bounded process-group cleanup.
-                # The supervisor itself remains in the caller's foreground.
-                start_new_session=True,
-            )
-            coordinator.register(reviewer.ordinal, proc)
             try:
-                try:
-                    exit_code = proc.wait(timeout=timeout_seconds)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    terminate_process(proc)
-                    exit_code = proc.returncode if proc.returncode is not None else 124
-            finally:
-                coordinator.unregister(reviewer.ordinal, proc)
-        except OSError as exc:
-            launch_error = f"failed to launch Cursor CLI: {exc}"
+                worker_exit = proc.wait(timeout=timeout_seconds + 30)
+            except subprocess.TimeoutExpired:
+                terminate_process(proc)
+                worker_exit = proc.returncode if proc.returncode is not None else 124
+        finally:
+            coordinator.unregister(reviewer.ordinal, proc)
+    except OSError:
+        events_path.touch(exist_ok=True)
+        stderr_path.touch(exist_ok=True)
 
-    completed_at = iso_now()
-    duration = time.monotonic() - started_monotonic
+    marker: dict[str, Any] | None = None
+    marker_errors: list[str] = []
+    try:
+        decoded = json.loads(terminal_path.read_text(encoding="utf-8"))
+        marker = decoded if isinstance(decoded, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        marker_errors.append(f"terminal marker unavailable: {exc}")
+    if marker is not None:
+        marker_errors.extend(
+            validate_terminal_marker(marker, reviewer, run_id, events_path, stderr_path)
+        )
     parsed = inspect_event_stream(events_path)
-    verified = model_matches(reviewer, parsed.reported_model)
+    verified = not marker_errors and catalog_model_verified(reviewer)
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
 
-    error_parts: list[str] = []
-    if launch_error:
-        error_parts.append(launch_error)
+    error_parts = list(marker_errors)
+    if worker_exit != 0:
+        error_parts.append(f"reviewer worker exited with status {worker_exit}")
+    exit_code = marker.get("exit_code") if marker is not None else None
+    timed_out = marker.get("timed_out") if marker is not None else None
+    if marker is not None and marker.get("launch_error"):
+        error_parts.append(str(marker["launch_error"]))
     if timed_out:
         error_parts.append(f"review timed out after {timeout_seconds} seconds")
     if exit_code != 0:
-        error_parts.append(f"Cursor CLI exited with status {exit_code}")
+        error_parts.append(f"OpenCode CLI exited with status {exit_code}")
+    if not catalog_model_verified(reviewer):
+        error_parts.append("requested model or variant was not verified by preflight catalog")
     error_parts.extend(parsed_review_errors(reviewer, parsed))
 
     status = "success" if not error_parts else "failed"
     result = ReviewResult(
         reviewer=reviewer.display_name,
         requested_model=reviewer.model_id,
-        reported_model=parsed.reported_model,
+        requested_variant=reviewer.variant,
+        reported_model=None,
         model_verified=verified,
+        model_verification_source="preflight_catalog_and_worker_terminal_marker",
         session_id=parsed.session_id,
         status=status,
         exit_code=exit_code,
         timed_out=timed_out,
-        started_at=started_at,
-        completed_at=completed_at,
-        duration_seconds=duration,
+        started_at=marker.get("started_at") if marker is not None else None,
+        completed_at=marker.get("completed_at") if marker is not None else None,
+        duration_seconds=marker.get("duration_seconds") if marker is not None else None,
         markdown_file=markdown_path.name,
         events_file=events_path.name,
         stderr_file=stderr_path.name,
-        command=command[:-1] + ["<effective-prompt>"],
+        command=command,
         error="; ".join(error_parts) if error_parts else None,
         warnings=list(parsed.warnings),
     )
@@ -1103,7 +1412,7 @@ def make_worker_failure_result(
     reviewer: Reviewer,
     staging_dir: Path,
     run_id: str,
-    agent_bin: str,
+    opencode_bin: str,
     effective_prompt: str,
     exc: BaseException,
 ) -> ReviewResult:
@@ -1113,12 +1422,14 @@ def make_worker_failure_result(
     stderr_path = staging_dir / f"{stem}.stderr.log"
     error = f"review worker crashed: {type(exc).__name__}: {exc}"
     timestamp = iso_now()
-    command = build_command(agent_bin, reviewer, effective_prompt)
+    command = build_command(opencode_bin, reviewer, Path("<workspace>"))
     result = ReviewResult(
         reviewer=reviewer.display_name,
         requested_model=reviewer.model_id,
+        requested_variant=reviewer.variant,
         reported_model=None,
         model_verified=False,
+        model_verification_source="worker_failure",
         session_id=None,
         status="failed",
         exit_code=70,
@@ -1129,7 +1440,7 @@ def make_worker_failure_result(
         markdown_file=markdown_path.name,
         events_file=events_path.name,
         stderr_file=stderr_path.name,
-        command=command[:-1] + ["<effective-prompt>"],
+        command=command,
         error=error,
     )
 
@@ -1174,6 +1485,52 @@ def manifest_path(run_dir: Path, run_id: str) -> Path:
     return run_dir / f"{run_id}-manifest.json"
 
 
+def tmux_launch_marker_path(run_dir: Path, run_id: str) -> Path:
+    return run_dir / f".{run_id}-tmux-session"
+
+
+def tmux_webhook_handoff_path(run_dir: Path, run_id: str) -> Path:
+    return run_dir / f".{run_id}-tmux-webhook"
+
+
+def prepare_tmux_webhook_handoff(
+    run_dir: Path,
+    run_id: str,
+    notification_mode: str,
+) -> Path | None:
+    if notification_mode not in {"auto", "webhook"}:
+        return None
+    webhook = os.environ.get(NOTIFICATION_WEBHOOK_ENV)
+    if not webhook:
+        return None
+    path = tmux_webhook_handoff_path(run_dir, run_id)
+    atomic_write_text(path, webhook)
+    return path
+
+
+def consume_tmux_webhook_handoff(
+    configured_path: Path | None,
+    run_dir: Path,
+    run_id: str,
+) -> None:
+    if configured_path is None:
+        return
+    expected = tmux_webhook_handoff_path(run_dir, run_id)
+    resolved = configured_path.expanduser().resolve()
+    if resolved != expected.resolve():
+        raise SystemExit("invalid tmux webhook handoff path")
+    try:
+        webhook = resolved.read_text(encoding="utf-8")
+    finally:
+        try:
+            resolved.unlink()
+        except OSError:
+            pass
+    if not webhook:
+        raise SystemExit("tmux webhook handoff is empty")
+    os.environ[NOTIFICATION_WEBHOOK_ENV] = webhook
+
+
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     atomic_write_text(
         path,
@@ -1189,9 +1546,13 @@ def write_running_manifest(
     effective_prompt: str,
     started_at: str,
     notification_mode: str,
+    execution_mode: str = EXECUTION_MODE,
+    tmux_session: str | None = None,
 ) -> None:
     payload = {
-        "schema_version": 2,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backend": BACKEND,
+        "provider": PROVIDER,
         "run_id": run_id,
         "status": "running",
         "started_at": started_at,
@@ -1201,13 +1562,17 @@ def write_running_manifest(
         "effective_prompt_sha256": hashlib.sha256(
             effective_prompt.encode("utf-8")
         ).hexdigest(),
-        "reasoning_policy": REASONING_POLICY,
+        "reviewers": reviewers_payload(REVIEWERS),
+        "reviewer_config_sha256": REVIEWER_CONFIG_HASH,
+        "catalog_verification": CATALOG_VERIFICATION,
         "parallel_reviewer_count": len(REVIEWERS),
-        "execution_mode": EXECUTION_MODE,
+        "execution_mode": execution_mode,
         "supervisor_pid": os.getpid(),
         "notification": notification_pending(notification_mode),
         "results": [],
     }
+    if tmux_session is not None:
+        payload["tmux_session"] = tmux_session
     write_json_atomic(manifest_path(run_dir, run_id), payload)
 
 
@@ -1222,13 +1587,17 @@ def write_final_manifest(
     interrupted_signal: int | None,
     notification_mode: str,
     *,
+    execution_mode: str = EXECUTION_MODE,
+    tmux_session: str | None = None,
     supervisor_pid: int | None = None,
     completed_at: str | None = None,
     extra_fields: dict[str, Any] | None = None,
 ) -> str:
     status = classify_status(results, interrupted_signal is not None)
     payload = {
-        "schema_version": 2,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backend": BACKEND,
+        "provider": PROVIDER,
         "run_id": run_id,
         "status": status,
         "started_at": started_at,
@@ -1238,14 +1607,18 @@ def write_final_manifest(
         "effective_prompt_sha256": hashlib.sha256(
             effective_prompt.encode("utf-8")
         ).hexdigest(),
-        "reasoning_policy": REASONING_POLICY,
+        "reviewers": reviewers_payload(REVIEWERS),
+        "reviewer_config_sha256": REVIEWER_CONFIG_HASH,
+        "catalog_verification": CATALOG_VERIFICATION,
         "parallel_reviewer_count": len(REVIEWERS),
-        "execution_mode": EXECUTION_MODE,
+        "execution_mode": execution_mode,
         "supervisor_pid": os.getpid() if supervisor_pid is None else supervisor_pid,
         "interrupted_signal": interrupted_signal,
         "notification": notification_pending(notification_mode),
         "results": [asdict(result) for result in results],
     }
+    if tmux_session is not None:
+        payload["tmux_session"] = tmux_session
     if extra_fields:
         payload.update(extra_fields)
     write_json_atomic(staging_dir / f"{run_id}-manifest.json", payload)
@@ -1341,139 +1714,152 @@ def read_review_brief(prompt_file: Path) -> tuple[str, str]:
     return review_brief, effective_prompt
 
 
-def ensure_file_credentials_default() -> None:
-    os.environ.setdefault("AGENT_CLI_CREDENTIAL_STORE", "file")
-
-
-def cursor_projects_directory() -> Path:
-    return Path.home() / ".cursor" / "projects"
-
-
-def workspace_trust_marker(
-    workspace: Path,
-    projects_dir: Path | None = None,
-) -> Path | None:
-    projects = projects_dir or cursor_projects_directory()
-    try:
-        project_dirs = list(projects.iterdir())
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise SystemExit(
-            "PREFLIGHT=cursor_state_unwritable\n"
-            f"Cursor CLI state is not accessible: {projects}\n"
-            f"{type(exc).__name__}: {exc}\n"
-            "Rerun this preflight and the eventual review launch outside the "
-            "filesystem sandbox."
-        ) from exc
-
-    expected = os.path.normcase(str(workspace.resolve()))
-    for project_dir in project_dirs:
-        marker = project_dir / ".workspace-trusted"
-        try:
-            payload = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        trusted_path = payload.get("workspacePath")
-        if not isinstance(trusted_path, str):
-            continue
-        candidate = os.path.normcase(str(Path(trusted_path).expanduser().resolve()))
-        if candidate == expected:
-            return marker
-    return None
-
-
-def verify_cursor_state_writable(workspace: Path) -> Path:
-    projects = cursor_projects_directory()
-    marker = workspace_trust_marker(workspace, projects)
-    target = marker.parent if marker is not None else projects
-    probe = target / f".monju-write-probe-{os.getpid()}-{secrets.token_hex(4)}"
-    try:
-        target.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
-        descriptor = os.open(
-            probe,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            PRIVATE_FILE_MODE,
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write("Monju Cursor state write probe\n")
-        probe.unlink()
-    except OSError as exc:
-        try:
-            probe.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise SystemExit(
-            "PREFLIGHT=cursor_state_unwritable\n"
-            f"Cursor CLI cannot write its state directory: {target}\n"
-            f"{type(exc).__name__}: {exc}\n"
-            "Rerun this preflight and the eventual review launch outside the "
-            "filesystem sandbox."
-        ) from exc
-    return projects
-
-
-def verify_workspace_trust(workspace: Path, projects_dir: Path) -> Path:
-    marker = workspace_trust_marker(workspace, projects_dir)
-    if marker is not None:
-        return marker
-    command = (
-        "AGENT_CLI_CREDENTIAL_STORE=file agent --workspace "
-        f"{shlex.quote(str(workspace))} --trust"
-    )
-    raise SystemExit(
-        "PREFLIGHT=workspace_trust_required\n"
-        f"Cursor CLI has not recorded trust for this workspace: {workspace}\n"
-        "Have the calling coding agent run this exact command with a PTY outside "
-        "the filesystem sandbox. After Cursor reaches its initial prompt, the "
-        "agent should interrupt it without submitting a prompt and rerun preflight:\n"
-        f"  {command}\n"
-        "This command grants Cursor Workspace Trust only. Do not use --yolo or "
-        "--force, and do not edit Cursor's trust marker directly."
+def opencode_state_directories() -> tuple[Path, Path]:
+    return (
+        Path.home() / ".local" / "share" / "opencode",
+        Path.home() / ".cache" / "opencode",
     )
 
 
-def verify_authentication(agent_bin: str) -> None:
+def verify_opencode_state_writable() -> tuple[Path, Path]:
+    directories = opencode_state_directories()
+    for target in directories:
+        probe = target / f".monju-write-probe-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            target.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR_MODE)
+            descriptor = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_FILE_MODE)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write("Monju OpenCode state write probe\n")
+            probe.unlink()
+        except OSError as exc:
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise SystemExit(
+                "PREFLIGHT=opencode_state_unwritable\n"
+                f"OpenCode cannot write its state directory: {target}\n"
+                f"{type(exc).__name__}: {exc}\n"
+                "Rerun this preflight and the eventual review launch outside the filesystem sandbox."
+            ) from exc
+    return directories
+
+
+def run_cli_capture(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
-            [agent_bin, "status"],
+        return subprocess.run(
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=20,
+            timeout=timeout,
             check=False,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"could not verify Cursor CLI authentication: {exc}") from exc
-    output = result.stdout.strip()
-    if result.returncode != 0 or re.search(r"\bnot logged in\b", output, re.IGNORECASE):
-        detail = output[-2000:] if output else "no status output"
+        raise SystemExit(f"could not run OpenCode CLI preflight: {exc}") from exc
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+
+
+def verify_opencode_authentication(opencode_bin: str) -> None:
+    result = run_cli_capture([opencode_bin, "auth", "list"])
+    output = strip_ansi(result.stdout)
+    if result.returncode != 0 or "0 credentials" in output or "OpenCode Go" not in output:
+        detail = output.strip()[-2000:] or "no authentication output"
         raise SystemExit(
-            "Cursor CLI file credential store is not authenticated.\n"
-            "Run this yourself, complete the browser login, and retry:\n"
-            "  AGENT_CLI_CREDENTIAL_STORE=file agent login\n"
-            f"Status output:\n{detail}"
+            "PREFLIGHT=opencode_auth_required\n"
+            "OpenCode Go authentication is not available. Run this yourself and retry:\n"
+            f"  {shlex.quote(opencode_bin)} auth login --provider {PROVIDER}\n"
+            f"Authentication output:\n{detail}"
         )
 
 
-def run_preflight_checks(workspace: Path, agent_bin: str) -> tuple[Path, Path]:
-    projects = verify_cursor_state_writable(workspace)
-    verify_authentication(agent_bin)
-    trust_marker = verify_workspace_trust(workspace, projects)
-    return projects, trust_marker
+def parse_verbose_model_catalog(output: str) -> dict[str, dict[str, Any]]:
+    models: dict[str, dict[str, Any]] = {}
+    decoder = json.JSONDecoder()
+    position = 0
+    pattern = re.compile(rf"(?m)^({re.escape(PROVIDER)}/[^\s]+)\s*$")
+    while match := pattern.search(output, position):
+        cursor = match.end()
+        while cursor < len(output) and output[cursor].isspace():
+            cursor += 1
+        try:
+            metadata, end = decoder.raw_decode(output, cursor)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"malformed verbose model catalog after {match.group(1)}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError(f"model metadata for {match.group(1)} is not an object")
+        variants = metadata.get("variants")
+        models[match.group(1)] = {
+            "status": metadata.get("status"),
+            "variants": sorted(variants) if isinstance(variants, dict) else [],
+        }
+        position = end
+    if not models:
+        raise ValueError("OpenCode returned no parseable OpenCode Go models")
+    return models
+
+
+def verify_model_catalog(opencode_bin: str) -> dict[str, Any]:
+    result = run_cli_capture([opencode_bin, "models", PROVIDER, "--verbose"], timeout=60)
+    output = strip_ansi(result.stdout)
+    if result.returncode != 0:
+        raise SystemExit(
+            "PREFLIGHT=opencode_models_unavailable\n"
+            f"OpenCode Go model catalog failed:\n{output.strip()[-3000:]}"
+        )
+    try:
+        models = parse_verbose_model_catalog(output)
+    except ValueError as exc:
+        raise SystemExit(f"PREFLIGHT=opencode_models_invalid\n{exc}") from exc
+    errors: list[str] = []
+    for reviewer in REVIEWERS:
+        metadata = models.get(reviewer.model_id)
+        if metadata is None:
+            errors.append(f"model is unavailable: {reviewer.model_id}")
+            continue
+        if metadata.get("status") not in {None, "active"}:
+            errors.append(f"model is not active: {reviewer.model_id}")
+        if reviewer.variant is not None and reviewer.variant not in metadata["variants"]:
+            errors.append(
+                f"variant is unavailable: {reviewer.model_id}/{reviewer.variant}; "
+                f"available={metadata['variants']}"
+            )
+    if errors:
+        raise SystemExit("PREFLIGHT=reviewer_model_invalid\n" + "\n".join(errors))
+    return {"verified_at": iso_now(), "provider": PROVIDER, "models": models}
+
+
+def run_preflight_checks(workspace: Path, opencode_bin: str) -> dict[str, Any]:
+    del workspace
+    state_dirs = verify_opencode_state_writable()
+    verify_opencode_authentication(opencode_bin)
+    catalog = verify_model_catalog(opencode_bin)
+    catalog["state_directories"] = [str(path) for path in state_dirs]
+    global CATALOG_VERIFICATION
+    CATALOG_VERIFICATION = catalog
+    return catalog
 
 
 def preflight_run(args: argparse.Namespace) -> int:
     workspace = resolve_workspace(args)
-    agent_bin = resolve_executable(args.agent_bin)
-    projects, trust_marker = run_preflight_checks(workspace, agent_bin)
+    opencode_bin = resolve_executable(args.opencode_bin)
+    tmux_bin = resolve_tmux_executable(args.tmux_bin)
+    tmux_server = inspect_tmux_server(tmux_bin)
+    catalog = run_preflight_checks(workspace, opencode_bin)
     print("PREFLIGHT=ok")
     print(f"WORKSPACE={workspace}")
-    print(f"CURSOR_PROJECTS_DIR={projects}")
-    print(f"WORKSPACE_TRUST={trust_marker}")
+    print(f"OPENCODE_BIN={opencode_bin}")
+    print(f"TMUX_BIN={tmux_bin}")
+    print(f"TMUX_SERVER={tmux_server}")
+    print(f"PROVIDER={PROVIDER}")
+    print(f"REVIEWERS={len(REVIEWERS)}")
+    print(f"CATALOG_MODELS={len(catalog['models'])}")
     return 0
 
 
@@ -1553,7 +1939,7 @@ def write_artifact_failure_manifest(
         pass
     current.update(
         {
-            "schema_version": 2,
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "run_id": run_id,
             "status": "artifact_failure",
             "completed_at": iso_now(),
@@ -1586,7 +1972,7 @@ def write_supervisor_failure_manifest(
         pass
     current.update(
         {
-            "schema_version": 2,
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "run_id": run_id,
             "status": "supervisor_failure",
             "completed_at": iso_now(),
@@ -1606,12 +1992,14 @@ def execute_reviews(
     prompt_file: Path,
     run_dir: Path,
     run_id: str,
-    agent_bin: str,
+    opencode_bin: str,
     timeout_seconds: int,
     review_brief: str,
     effective_prompt: str,
     run_started_at: str,
     notification_mode: str,
+    execution_mode: str = EXECUTION_MODE,
+    tmux_session: str | None = None,
 ) -> int:
     staging_parent = Path(tempfile.mkdtemp(prefix=f"{run_id}-staging-"))
     staging_dir = staging_parent / run_id
@@ -1633,7 +2021,7 @@ def execute_reviews(
     def worker(reviewer: Reviewer) -> None:
         try:
             result = run_reviewer(
-                agent_bin=agent_bin,
+                opencode_bin=opencode_bin,
                 reviewer=reviewer,
                 effective_prompt=effective_prompt,
                 staging_dir=staging_dir,
@@ -1647,7 +2035,7 @@ def execute_reviews(
                 reviewer,
                 staging_dir,
                 run_id,
-                agent_bin,
+                opencode_bin,
                 effective_prompt,
                 exc,
             )
@@ -1660,6 +2048,8 @@ def execute_reviews(
         raise RunInterrupted(signum)
 
     old_sigterm = signal.signal(signal.SIGTERM, sigterm_handler)
+    sighup = getattr(signal, "SIGHUP", None)
+    old_sighup = signal.signal(sighup, sigterm_handler) if sighup is not None else None
     threads = [
         threading.Thread(
             target=worker,
@@ -1684,7 +2074,7 @@ def execute_reviews(
                 coordinator.terminate_all()
             except RunInterrupted as exc:
                 interrupted_signal = exc.signum
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(exc.signum, signal.SIG_IGN)
                 coordinator.terminate_all()
             finally:
                 if interrupted_signal is not None:
@@ -1693,6 +2083,8 @@ def execute_reviews(
                     thread.join()
     finally:
         signal.signal(signal.SIGTERM, old_sigterm)
+        if sighup is not None and old_sighup is not None:
+            signal.signal(sighup, old_sighup)
 
     results: list[ReviewResult] = []
     for reviewer in REVIEWERS:
@@ -1702,7 +2094,7 @@ def execute_reviews(
                 reviewer,
                 staging_dir,
                 run_id,
-                agent_bin,
+                opencode_bin,
                 effective_prompt,
                 RuntimeError("review worker produced no result"),
             )
@@ -1718,6 +2110,8 @@ def execute_reviews(
         run_started_at,
         interrupted_signal,
         notification_mode,
+        execution_mode=execution_mode,
+        tmux_session=tmux_session,
     )
 
     try:
@@ -1853,8 +2247,10 @@ def assess_recovery(run_dir: Path, run_id: str) -> RecoveryAssessment:
             reviewer,
         )
         parsed: ParsedEventStream | None = None
+        terminal: dict[str, Any] | None = None
+        terminal_path = terminal_marker_path(staging_dir, run_id, reviewer)
         read_error: str | None = None
-        validation_errors: tuple[str, ...] = ()
+        validation_error_list: list[str] = []
         terminal_complete = False
         if not events_path.is_file():
             read_error = f"event stream is missing for {reviewer.display_name}"
@@ -1868,16 +2264,41 @@ def assess_recovery(run_dir: Path, run_id: str) -> RecoveryAssessment:
                 )
                 invalid = True
             else:
-                terminal_complete = parsed.terminal_result_count > 0
-                if terminal_complete:
+                validation_error_list.extend(parsed_review_errors(reviewer, parsed))
+        if terminal_path.is_file():
+            try:
+                decoded = json.loads(terminal_path.read_text(encoding="utf-8"))
+                terminal = decoded if isinstance(decoded, dict) else None
+            except (OSError, json.JSONDecodeError) as exc:
+                validation_error_list.append(f"malformed terminal marker: {exc}")
+                invalid = True
+            if terminal is not None:
+                marker_errors = validate_terminal_marker(
+                    terminal, reviewer, run_id, events_path, stderr_path
+                )
+                if marker_errors:
+                    validation_error_list.extend(marker_errors)
+                    invalid = True
+                else:
+                    terminal_complete = True
                     terminal_results += 1
-                validation_errors = tuple(parsed_review_errors(reviewer, parsed))
-                if parsed.malformed_lines:
-                    invalid = True
-                if terminal_complete and validation_errors:
-                    invalid = True
-                if terminal_complete and not validation_errors:
-                    successful_results += 1
+                    if terminal.get("timed_out"):
+                        validation_error_list.append("review timed out")
+                    if terminal.get("launch_error"):
+                        validation_error_list.append(str(terminal["launch_error"]))
+                    if terminal.get("exit_code") != 0:
+                        validation_error_list.append(
+                            f"OpenCode CLI exited with status {terminal.get('exit_code')}"
+                        )
+                    if not catalog_model_verified(reviewer):
+                        validation_error_list.append(
+                            "requested model or variant was not verified at launch"
+                        )
+        validation_errors = tuple(validation_error_list)
+        if terminal_complete and validation_errors:
+            invalid = True
+        if terminal_complete and not validation_errors:
+            successful_results += 1
         if read_error:
             assessment_errors.append(read_error)
         assessment_errors.extend(
@@ -1888,7 +2309,9 @@ def assess_recovery(run_dir: Path, run_id: str) -> RecoveryAssessment:
                 reviewer=reviewer,
                 events_path=events_path,
                 stderr_path=stderr_path,
+                terminal_path=terminal_path,
                 parsed=parsed,
+                terminal=terminal,
                 terminal_complete=terminal_complete,
                 validation_errors=validation_errors,
                 read_error=read_error,
@@ -1946,9 +2369,10 @@ def diagnose_stale_run(run_dir: Path, run_id: str) -> dict[str, Any]:
             parsed = inspect_event_stream(events_path)
         except OSError:
             parsed = None
-        if parsed is not None and model_matches(reviewer, parsed.reported_model):
+        if parsed is not None and parsed.event_count:
             diagnostics["initialized_reviewers"] += 1
-        if parsed is not None and parsed.terminal_result_count:
+        terminal_path = terminal_marker_path(staging_dir, run_id, reviewer)
+        if terminal_path.is_file():
             diagnostics["completed_reviewers"] += 1
         try:
             stderr_text = stderr_path.read_text(
@@ -1995,9 +2419,32 @@ def read_status(args: argparse.Namespace) -> int:
     path = manifest_path(run_dir, run_id)
     if not path.is_file():
         prompt_file = default_prompt_path(run_dir, run_id)
-        status = "prepared" if prompt_file.is_file() else "unknown"
+        tmux_alive = False
+        tmux_error: str | None = None
+        tmux_marker = tmux_launch_marker_path(run_dir, run_id)
+        if prompt_file.is_file() and tmux_marker.is_file():
+            try:
+                tmux_bin = resolve_tmux_executable(
+                    str(getattr(args, "tmux_bin", DEFAULT_TMUX_BIN))
+                )
+                tmux_alive = tmux_session_is_running(tmux_bin, run_id)
+            except (FileNotFoundError, RuntimeError) as exc:
+                tmux_error = str(exc)
+        if tmux_alive:
+            status = "tmux_starting"
+        elif tmux_marker.is_file():
+            status = "tmux_launch_failed"
+        else:
+            status = "prepared" if prompt_file.is_file() else "unknown"
         print(f"RUN_DIR={run_dir}")
         print(f"STATUS={status}")
+        if tmux_alive:
+            print(f"EXECUTION_MODE={TMUX_EXECUTION_MODE}")
+            print(f"TMUX_SESSION={run_id}")
+            print("TMUX_SESSION_ALIVE=yes")
+        elif tmux_marker.is_file() and tmux_error is not None:
+            print("TMUX_SESSION_ALIVE=unknown")
+            print(f"TMUX_SESSION_REASON={tmux_error}")
         return 0
 
     try:
@@ -2005,6 +2452,26 @@ def read_status(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"invalid manifest JSON: {path}: {exc}") from exc
     status = str(payload.get("status") or "unknown")
+    execution_mode = str(payload.get("execution_mode") or EXECUTION_MODE)
+    tmux_session: str | None = None
+    tmux_session_alive: bool | None = None
+    tmux_session_error: str | None = None
+    if execution_mode == TMUX_EXECUTION_MODE:
+        raw_tmux_session = payload.get("tmux_session")
+        if isinstance(raw_tmux_session, str) and raw_tmux_session == run_id:
+            tmux_session = raw_tmux_session
+            try:
+                tmux_bin = resolve_tmux_executable(
+                    str(getattr(args, "tmux_bin", DEFAULT_TMUX_BIN))
+                )
+                tmux_session_alive = tmux_session_is_running(
+                    tmux_bin,
+                    tmux_session,
+                )
+            except (FileNotFoundError, RuntimeError) as exc:
+                tmux_session_error = str(exc)
+        else:
+            tmux_session_error = "manifest has no valid tmux session"
     pid_file = run_dir / f"{run_id}-runner.pid"
     runner_pid: str | None = None
     if pid_file.is_file():
@@ -2013,21 +2480,55 @@ def read_status(args: argparse.Namespace) -> int:
         runner_pid = str(payload["supervisor_pid"])
     stale_diagnostics: dict[str, Any] | None = None
     recovery: RecoveryAssessment | None = None
-    if status == "running" and runner_pid:
+    recovery_config_error: str | None = None
+    recovery_candidate = status == "running" or status in RECOVERABLE_FAILURE_STATUSES
+    if recovery_candidate:
         try:
-            runner_running = process_is_running(int(runner_pid))
-        except (OSError, ValueError):
-            runner_running = False
+            manifest_reviewers = reviewers_from_manifest(payload)
+            configure_reviewers(manifest_reviewers, str(payload["reviewer_config_sha256"]))
+            catalog = payload.get("catalog_verification")
+            if not isinstance(catalog, dict):
+                raise ValueError("running manifest has no catalog verification")
+            global CATALOG_VERIFICATION
+            CATALOG_VERIFICATION = catalog
+        except (KeyError, ValueError) as exc:
+            recovery_config_error = str(exc)
+    if status == "running" and runner_pid:
+        if tmux_session_alive is not None:
+            runner_running = tmux_session_alive
+        else:
+            try:
+                runner_running = process_is_running(int(runner_pid))
+            except (OSError, ValueError):
+                runner_running = False
         if not runner_running:
             status = "stale_running"
-            stale_diagnostics = diagnose_stale_run(run_dir, run_id)
-            recovery = assess_recovery(run_dir, run_id)
+            if recovery_config_error is None:
+                stale_diagnostics = diagnose_stale_run(run_dir, run_id)
+                recovery = assess_recovery(run_dir, run_id)
+    elif status in RECOVERABLE_FAILURE_STATUSES and recovery_config_error is None:
+        recovery = assess_recovery(run_dir, run_id)
     print(f"RUN_DIR={run_dir}")
     print(f"STATUS={status}")
     print(f"MANIFEST={path}")
     if runner_pid:
         print(f"RUNNER_PID={runner_pid}")
-    if stale_diagnostics is not None:
+    if execution_mode == TMUX_EXECUTION_MODE:
+        if tmux_session is not None:
+            print(f"TMUX_SESSION={tmux_session}")
+        if tmux_session_alive is not None:
+            print(
+                "TMUX_SESSION_ALIVE="
+                f"{'yes' if tmux_session_alive else 'no'}"
+            )
+        else:
+            print("TMUX_SESSION_ALIVE=unknown")
+        if tmux_session_error is not None:
+            print(f"TMUX_SESSION_REASON={tmux_session_error}")
+    if recovery_candidate and recovery_config_error is not None:
+        print("RECOVERY=invalid")
+        print(f"RECOVERY_REASON={recovery_config_error}")
+    elif stale_diagnostics is not None:
         print(f"STALE_REASON={stale_diagnostics['reason']}")
         print(
             "STALE_PROGRESS="
@@ -2059,11 +2560,25 @@ def read_status(args: argparse.Namespace) -> int:
                 "RECOVERY_CAN_PUBLISH="
                 f"{'yes' if recovery.can_publish else 'no'}"
             )
-    elif status in TERMINAL_STATUSES:
+    elif status in RECOVERABLE_FAILURE_STATUSES and recovery is not None:
+        print(f"RECOVERY={recovery.state}")
+        print(
+            f"RECOVERY_TERMINAL_RESULTS={recovery.terminal_results}/"
+            f"{len(REVIEWERS)}"
+        )
+        print(
+            f"RECOVERY_SUCCESSFUL_RESULTS={recovery.successful_results}/"
+            f"{len(REVIEWERS)}"
+        )
+        print(
+            "RECOVERY_CAN_PUBLISH="
+            f"{'yes' if recovery.can_publish else 'no'}"
+        )
+    elif status in PUBLISHED_STATUSES:
         print("RECOVERY=published")
     elif status != "running":
         print("RECOVERY=invalid")
-    for result in payload.get("results", []):
+    for result in payload.get("results", []) if status in PUBLISHED_STATUSES else []:
         if not isinstance(result, dict):
             continue
         markdown_file = result.get("markdown_file")
@@ -2176,28 +2691,23 @@ def recovered_review_result(
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         stderr_text = ""
-    try:
-        completed_at = datetime.fromtimestamp(
-            stream.events_path.stat().st_mtime,
-            UTC,
-        ).isoformat(timespec="milliseconds")
-    except OSError:
-        completed_at = None
-
+    terminal = stream.terminal or {}
     errors = list(stream.validation_errors)
-    verified = model_matches(stream.reviewer, parsed.reported_model)
+    verified = not errors and catalog_model_verified(stream.reviewer)
     result = ReviewResult(
         reviewer=stream.reviewer.display_name,
         requested_model=stream.reviewer.model_id,
-        reported_model=parsed.reported_model,
+        requested_variant=stream.reviewer.variant,
+        reported_model=None,
         model_verified=verified,
+        model_verification_source="launch_catalog_and_preserved_terminal_marker",
         session_id=parsed.session_id,
         status="success" if not errors else "failed",
-        exit_code=None,
-        timed_out=None,
-        started_at=None,
-        completed_at=completed_at,
-        duration_seconds=parsed.terminal_duration_seconds,
+        exit_code=terminal.get("exit_code"),
+        timed_out=terminal.get("timed_out"),
+        started_at=terminal.get("started_at"),
+        completed_at=terminal.get("completed_at"),
+        duration_seconds=terminal.get("duration_seconds"),
         markdown_file=markdown_path.name,
         events_file=stream.events_path.name,
         stderr_file=stderr_path.name,
@@ -2206,26 +2716,20 @@ def recovered_review_result(
         warnings=[
             *parsed.warnings,
             (
-                "Recovered from a preserved Cursor event stream after supervisor "
-                "loss; reviewer start time and process exit status are unavailable."
+                "Recovered from a preserved OpenCode event stream and verified "
+                "worker terminal marker after supervisor loss."
             ),
         ],
         recovered=True,
         timing_source={
-            "started_at": None,
-            "completed_at": (
-                "event_stream_file_mtime" if completed_at is not None else None
-            ),
-            "duration_seconds": (
-                "terminal_result.duration_ms"
-                if parsed.terminal_duration_seconds is not None
-                else None
-            ),
+            "started_at": "worker_terminal_marker",
+            "completed_at": "worker_terminal_marker",
+            "duration_seconds": "worker_terminal_marker",
         },
         recovery_validation={
             "event_count": parsed.event_count,
-            "terminal_result_count": parsed.terminal_result_count,
-            "terminal_result_is_last": parsed.terminal_result_is_last,
+            "text_event_count": parsed.text_event_count,
+            "terminal_marker": stream.terminal_path.name,
             "malformed_event_lines": list(parsed.malformed_lines),
             "model_verified": verified,
             "errors": errors,
@@ -2266,19 +2770,67 @@ def recover_review(args: argparse.Namespace) -> int:
         )
 
     current_status = str(payload.get("status") or "unknown")
-    if current_status in TERMINAL_STATUSES:
+    if current_status in PUBLISHED_STATUSES:
         return read_status(args)
-    if current_status != "running":
+    if (
+        current_status != "running"
+        and current_status not in RECOVERABLE_FAILURE_STATUSES
+    ):
         return report_recovery_refusal(
             run_dir,
             "recovery_invalid",
             "invalid",
             detail=f"manifest has unsupported status: {current_status}",
         )
+    try:
+        manifest_reviewers = reviewers_from_manifest(payload)
+        configure_reviewers(manifest_reviewers, str(payload["reviewer_config_sha256"]))
+        catalog = payload.get("catalog_verification")
+        if not isinstance(catalog, dict):
+            raise ValueError("running manifest has no catalog verification")
+        global CATALOG_VERIFICATION
+        CATALOG_VERIFICATION = catalog
+    except (KeyError, ValueError) as exc:
+        return report_recovery_refusal(
+            run_dir,
+            "recovery_invalid",
+            "invalid",
+            detail=str(exc),
+        )
     if args.notify in {"auto", "webhook"}:
         raise SystemExit(
             "--recover never uses the network; use --notify none or --notify desktop"
         )
+
+    tmux_supervisor_absent = False
+    if payload.get("execution_mode") == TMUX_EXECUTION_MODE:
+        tmux_session = payload.get("tmux_session")
+        if not isinstance(tmux_session, str) or tmux_session != run_id:
+            return report_recovery_refusal(
+                run_dir,
+                "recovery_invalid",
+                "invalid",
+                detail="running manifest has no valid tmux session",
+            )
+        try:
+            tmux_bin = resolve_tmux_executable(
+                str(getattr(args, "tmux_bin", DEFAULT_TMUX_BIN))
+            )
+            if tmux_session_is_running(tmux_bin, tmux_session):
+                return report_recovery_refusal(
+                    run_dir,
+                    "recovery_refused",
+                    "refused",
+                    detail="recorded tmux supervisor session is still running",
+                )
+            tmux_supervisor_absent = True
+        except (FileNotFoundError, RuntimeError) as exc:
+            return report_recovery_refusal(
+                run_dir,
+                "recovery_invalid",
+                "invalid",
+                detail=f"could not verify tmux supervisor state: {exc}",
+            )
 
     try:
         original_supervisor_pid = recorded_supervisor_pid(
@@ -2293,7 +2845,7 @@ def recover_review(args: argparse.Namespace) -> int:
             "invalid",
             detail=str(exc),
         )
-    if process_is_running(original_supervisor_pid):
+    if not tmux_supervisor_absent and process_is_running(original_supervisor_pid):
         return report_recovery_refusal(
             run_dir,
             "recovery_refused",
@@ -2312,7 +2864,7 @@ def recover_review(args: argparse.Namespace) -> int:
             detail = assessment.errors[0]
         elif assessment.state == "not_ready":
             detail = (
-                "not all reviewer streams contain a terminal result "
+                "not all reviewers have a verified terminal marker "
                 f"({assessment.terminal_results}/{len(REVIEWERS)})"
             )
         else:
@@ -2393,6 +2945,12 @@ def recover_review(args: argparse.Namespace) -> int:
             else None,
             None,
             args.notify,
+            execution_mode=str(payload.get("execution_mode") or EXECUTION_MODE),
+            tmux_session=(
+                str(payload["tmux_session"])
+                if isinstance(payload.get("tmux_session"), str)
+                else None
+            ),
             supervisor_pid=original_supervisor_pid,
             completed_at=recovered_at,
             extra_fields={
@@ -2404,6 +2962,7 @@ def recover_review(args: argparse.Namespace) -> int:
                 "completed_at_source": "recovery_publication_time",
                 "review_completed_at": None,
                 "recovery_assessment": assessment.state,
+                "recovery_previous_status": current_status,
             },
         )
     except Exception as exc:  # noqa: BLE001 - raw staging must survive recovery.
@@ -2453,7 +3012,7 @@ def dry_run(args: argparse.Namespace) -> int:
         run_id, run_dir = validate_run_dir(args.run_dir)
     prompt_file = resolve_prompt_file(args, run_dir, run_id)
     _, _effective_prompt = read_review_brief(prompt_file)
-    agent_bin = shutil.which(args.agent_bin) or args.agent_bin
+    opencode_bin = resolve_executable(args.opencode_bin)
     output_root = (
         resolve_output_root(args, workspace)
         if args.output_root is not None or run_dir is None
@@ -2474,10 +3033,10 @@ def dry_run(args: argparse.Namespace) -> int:
             {
                 "reviewer": reviewer.display_name,
                 "model_id": reviewer.model_id,
-                "argv": build_command(agent_bin, reviewer, "<effective-prompt>"),
-                "shell_display": shlex.join(
-                    build_command(agent_bin, reviewer, "<effective-prompt>")
-                ),
+                "variant": reviewer.variant,
+                "argv": build_command(opencode_bin, reviewer, workspace),
+                "shell_display": shlex.join(build_command(opencode_bin, reviewer, workspace)),
+                "prompt_transport": "stdin",
             }
             for reviewer in REVIEWERS
         ],
@@ -2486,16 +3045,28 @@ def dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def announce_foreground_run(run_dir: Path, run_id: str) -> None:
+def announce_supervisor_run(
+    run_dir: Path,
+    run_id: str,
+    execution_mode: str,
+    tmux_session: str | None,
+) -> None:
     print(f"RUN_DIR={run_dir}")
     print("STATUS=running")
-    print(f"EXECUTION_MODE={EXECUTION_MODE}")
+    print(f"EXECUTION_MODE={execution_mode}")
+    if tmux_session is not None:
+        print(f"TMUX_SESSION={tmux_session}")
     print(f"RUNNER_PID={os.getpid()}")
     print(f"MANIFEST={manifest_path(run_dir, run_id)}")
     sys.stdout.flush()
 
 
-def run_requested_review(args: argparse.Namespace) -> int:
+def run_requested_review(
+    args: argparse.Namespace,
+    *,
+    execution_mode: str = EXECUTION_MODE,
+    tmux_session: str | None = None,
+) -> int:
     workspace = resolve_workspace(args)
     run_id: str
     run_dir: Path
@@ -2509,8 +3080,8 @@ def run_requested_review(args: argparse.Namespace) -> int:
     prompt_file = resolve_prompt_file(args, run_dir, run_id)
     canonical_prompt = default_prompt_path(run_dir, run_id)
     review_brief, effective_prompt = read_review_brief(prompt_file)
-    agent_bin = resolve_executable(args.agent_bin)
-    run_preflight_checks(workspace, agent_bin)
+    opencode_bin = resolve_executable(args.opencode_bin)
+    run_preflight_checks(workspace, opencode_bin)
 
     run_started_at = iso_now()
     claim_run(run_dir)
@@ -2528,43 +3099,325 @@ def run_requested_review(args: argparse.Namespace) -> int:
         effective_prompt,
         run_started_at,
         args.notify,
+        execution_mode,
+        tmux_session,
     )
     atomic_write_text(
         run_dir / f"{run_id}-runner.pid",
         f"{os.getpid()}\n",
     )
-    announce_foreground_run(run_dir, run_id)
+    announce_supervisor_run(
+        run_dir,
+        run_id,
+        execution_mode,
+        tmux_session,
+    )
 
     return execute_reviews(
         workspace=workspace,
         prompt_file=canonical_prompt,
         run_dir=run_dir,
         run_id=run_id,
-        agent_bin=agent_bin,
+        opencode_bin=opencode_bin,
         timeout_seconds=args.timeout_seconds,
         review_brief=review_brief,
         effective_prompt=effective_prompt,
         run_started_at=run_started_at,
         notification_mode=args.notify,
+        execution_mode=execution_mode,
+        tmux_session=tmux_session,
     )
+
+
+def supervisor_log_path(run_dir: Path, run_id: str, stream: str) -> Path:
+    return run_dir / f"{run_id}-runner.{stream}.log"
+
+
+def open_private_append(path: Path) -> Any:
+    descriptor = os.open(
+        path,
+        os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+        PRIVATE_FILE_MODE,
+    )
+    return os.fdopen(descriptor, "a", encoding="utf-8", buffering=1)
+
+
+def run_tmux_supervisor(args: argparse.Namespace) -> int:
+    if args.run_dir is None:
+        raise SystemExit("--tmux-supervisor requires --run-dir")
+    run_id, run_dir = validate_run_dir(args.run_dir)
+    if args.tmux_session != run_id:
+        raise SystemExit("tmux session must exactly match the validated run ID")
+    if not os.environ.get("TMUX"):
+        raise SystemExit("--tmux-supervisor must run inside tmux")
+
+    stdout_path = supervisor_log_path(run_dir, run_id, "stdout")
+    stderr_path = supervisor_log_path(run_dir, run_id, "stderr")
+    with (
+        open_private_append(stdout_path) as stdout_stream,
+        open_private_append(stderr_path) as stderr_stream,
+        contextlib.redirect_stdout(stdout_stream),
+        contextlib.redirect_stderr(stderr_stream),
+    ):
+        try:
+            os.environ.pop(NOTIFICATION_WEBHOOK_ENV, None)
+            consume_tmux_webhook_handoff(
+                args.tmux_webhook_file,
+                run_dir,
+                run_id,
+            )
+            return run_requested_review(
+                args,
+                execution_mode=TMUX_EXECUTION_MODE,
+                tmux_session=run_id,
+            )
+        except SystemExit as exc:
+            if exc.code is not None and exc.code != 0:
+                print(str(exc.code), file=sys.stderr, flush=True)
+            return exc.code if isinstance(exc.code, int) else 2
+        except Exception as exc:  # noqa: BLE001 - preserve supervisor diagnostics.
+            write_supervisor_failure_manifest(run_dir, run_id, exc)
+            notify_terminal_status(
+                args.notify,
+                run_dir,
+                run_id,
+                "supervisor_failure",
+            )
+            print(
+                f"Monju supervisor failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 70
+
+
+def tmux_supervisor_command(
+    args: argparse.Namespace,
+    workspace: Path,
+    run_dir: Path,
+    prompt_file: Path,
+    opencode_bin: str,
+    tmux_session: str,
+    webhook_handoff: Path | None,
+) -> list[str]:
+    reviewers_file = args.reviewers_file.expanduser().resolve()
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--tmux-supervisor",
+        "--tmux-session",
+        tmux_session,
+        "--workspace",
+        str(workspace),
+        "--run-dir",
+        str(run_dir),
+        "--prompt-file",
+        str(prompt_file),
+        "--opencode-bin",
+        opencode_bin,
+        "--reviewers-file",
+        str(reviewers_file),
+        "--timeout-seconds",
+        str(args.timeout_seconds),
+        "--notify",
+        args.notify,
+    ]
+    if webhook_handoff is not None:
+        command.extend(["--tmux-webhook-file", str(webhook_handoff)])
+    return command
+
+
+def read_supervisor_log_excerpt(run_dir: Path, run_id: str) -> str:
+    path = supervisor_log_path(run_dir, run_id, "stderr")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return content[-4000:]
+
+
+def announce_tmux_launch(
+    run_dir: Path,
+    run_id: str,
+    payload: dict[str, Any],
+    tmux_server: str,
+    tmux_alive: bool,
+) -> None:
+    print(f"RUN_DIR={run_dir}")
+    print(f"STATUS={payload.get('status', 'unknown')}")
+    print(f"EXECUTION_MODE={TMUX_EXECUTION_MODE}")
+    print(f"TMUX_SESSION={run_id}")
+    print(f"TMUX_SERVER={tmux_server}")
+    print(f"TMUX_SESSION_ALIVE={'yes' if tmux_alive else 'no'}")
+    supervisor_pid = payload.get("supervisor_pid")
+    if isinstance(supervisor_pid, int):
+        print(f"RUNNER_PID={supervisor_pid}")
+    print(f"MANIFEST={manifest_path(run_dir, run_id)}")
+
+
+def launch_tmux_review(args: argparse.Namespace) -> int:
+    if args.run_dir is None:
+        raise SystemExit("--tmux requires a prepared --run-dir")
+    workspace = resolve_workspace(args)
+    run_id, run_dir = validate_run_dir(args.run_dir)
+    prompt_file = resolve_prompt_file(args, run_dir, run_id)
+    read_review_brief(prompt_file)
+    opencode_bin = resolve_executable(args.opencode_bin)
+    tmux_bin = resolve_tmux_executable(args.tmux_bin)
+    tmux_server = inspect_tmux_server(tmux_bin)
+
+    if (run_dir / ".monju-started").exists():
+        raise SystemExit(f"run directory was already started: {run_dir}")
+    if tmux_session_is_running(tmux_bin, run_id):
+        raise SystemExit(f"tmux session already exists for run: {run_id}")
+
+    launch_marker = tmux_launch_marker_path(run_dir, run_id)
+    atomic_write_text(launch_marker, f"{run_id}\n")
+    webhook_handoff = prepare_tmux_webhook_handoff(
+        run_dir,
+        run_id,
+        args.notify,
+    )
+
+    supervisor_command = tmux_supervisor_command(
+        args,
+        workspace,
+        run_dir,
+        prompt_file,
+        opencode_bin,
+        run_id,
+        webhook_handoff,
+    )
+    try:
+        result = run_tmux_capture(
+            tmux_bin,
+            [
+                "new-session",
+                "-d",
+                "-s",
+                run_id,
+                "-c",
+                str(workspace),
+                *supervisor_command,
+            ],
+        )
+    except Exception:
+        for path_to_remove in (launch_marker, webhook_handoff):
+            if path_to_remove is None:
+                continue
+            try:
+                path_to_remove.unlink()
+            except OSError:
+                pass
+        raise
+    if result.returncode != 0:
+        try:
+            launch_marker.unlink()
+        except OSError:
+            pass
+        if webhook_handoff is not None:
+            try:
+                webhook_handoff.unlink()
+            except OSError:
+                pass
+        detail = strip_ansi(result.stdout).strip()
+        raise SystemExit(
+            "TMUX_LAUNCH=failed\n"
+            f"{detail or f'tmux exited with status {result.returncode}'}"
+        )
+
+    path = manifest_path(run_dir, run_id)
+    deadline = time.monotonic() + TMUX_STARTUP_TIMEOUT_SECONDS
+    last_tmux_alive = True
+    while time.monotonic() < deadline:
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("run_id") == run_id:
+                status = str(payload.get("status") or "unknown")
+                if status != "unknown":
+                    try:
+                        last_tmux_alive = tmux_session_is_running(
+                            tmux_bin,
+                            run_id,
+                        )
+                    except RuntimeError:
+                        last_tmux_alive = status == "running"
+                    announce_tmux_launch(
+                        run_dir,
+                        run_id,
+                        payload,
+                        tmux_server,
+                        last_tmux_alive,
+                    )
+                    return 0 if status == "running" else terminal_exit_code(status)
+        try:
+            last_tmux_alive = tmux_session_is_running(tmux_bin, run_id)
+        except RuntimeError:
+            last_tmux_alive = True
+        if not last_tmux_alive:
+            break
+        time.sleep(0.05)
+
+    if last_tmux_alive:
+        print(f"RUN_DIR={run_dir}")
+        print("STATUS=tmux_starting")
+        print(f"EXECUTION_MODE={TMUX_EXECUTION_MODE}")
+        print(f"TMUX_SESSION={run_id}")
+        print(f"TMUX_SERVER={tmux_server}")
+        print("TMUX_SESSION_ALIVE=yes")
+        return 0
+
+    print(f"RUN_DIR={run_dir}")
+    print("STATUS=tmux_launch_failed")
+    print(f"TMUX_SESSION={run_id}")
+    print("TMUX_SESSION_ALIVE=no")
+    if webhook_handoff is not None:
+        try:
+            webhook_handoff.unlink()
+        except OSError:
+            pass
+    excerpt = read_supervisor_log_excerpt(run_dir, run_id)
+    if excerpt:
+        print(f"ERROR={excerpt}", file=sys.stderr)
+    return 70
 
 
 def main() -> int:
     os.umask(0o077)
-    ensure_file_credentials_default()
     args = parse_args()
-    validate_quality_policy()
+    if args.reviewer_worker is not None:
+        return run_reviewer_worker(args.reviewer_worker)
+
+    if args.preflight or args.dry_run or args.tmux or args.tmux_supervisor or not any(
+        (
+            args.prepare,
+            args.status,
+            args.recover,
+            args.background,
+            args.tmux,
+            args.tmux_supervisor,
+        )
+    ):
+        reviewers, config_hash = load_reviewer_configuration(args.reviewers_file)
+        configure_reviewers(reviewers, config_hash)
 
     if args.background:
         raise SystemExit(
             "--background is unsafe under Codex process cleanup and is no longer "
-            "supported. Omit it and keep this runner in the foreground of a Codex "
-            "unified-exec background terminal."
+            "supported. Use --tmux for a tracked persistent supervisor or omit it "
+            "for a direct foreground run."
         )
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be greater than zero")
     if args.preflight:
         return preflight_run(args)
+    if args.tmux:
+        return launch_tmux_review(args)
+    if args.tmux_supervisor:
+        return run_tmux_supervisor(args)
     if args.prepare:
         return prepare_run(args)
     if args.status:

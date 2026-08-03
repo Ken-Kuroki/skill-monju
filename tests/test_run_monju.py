@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -15,60 +17,83 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
-from scripts import run_monju
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts" / "run_monju.py"
+SPEC = importlib.util.spec_from_file_location("run_monju", SCRIPT)
+assert SPEC and SPEC.loader
+run_monju = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = run_monju
+SPEC.loader.exec_module(run_monju)
+
+REVIEW_TEXT = "# Verdict\nLooks sound.\n\n# Findings\n## Act now\nNone.\n\n## Usually defer (YAGNI)\nNone.\n\n# Gaps and uncertainties\nNone.\n\n# Proposed experiments\nNo additional experiment is warranted.\n\n# Recommended next actions\nNone."
 
 
-REVIEW_TEXT = """\
-# Verdict
-ok
-# Findings
-## Act now
-none
-## Usually defer (YAGNI)
-none
-# Gaps and uncertainties
-none
-# Proposed experiments
-No additional experiment is warranted.
-# Recommended next actions
-none
-"""
+class FlushRecorder(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
 
 
 class RunnerTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._test_home_context = tempfile.TemporaryDirectory()
-        self.test_home = Path(self._test_home_context.name)
-
-    def tearDown(self) -> None:
-        self._test_home_context.cleanup()
+        reviewers, config_hash = run_monju.load_reviewer_configuration(
+            REPOSITORY / "reviewers.json"
+        )
+        run_monju.configure_reviewers(reviewers, config_hash)
+        run_monju.CATALOG_VERIFICATION = self.catalog_for(reviewers)
 
     @staticmethod
-    def trust_workspace(workspace: Path, home: Path) -> Path:
-        project = home / ".cursor" / "projects" / (
-            f"workspace-{abs(hash(str(workspace.resolve())))}"
-        )
-        project.mkdir(parents=True, exist_ok=True)
-        marker = project / ".workspace-trusted"
-        marker.write_text(
-            json.dumps(
-                {
-                    "trustedAt": "2026-01-01T00:00:00.000Z",
-                    "workspacePath": str(workspace.resolve()),
+    def catalog_for(reviewers: tuple[run_monju.Reviewer, ...]) -> dict[str, object]:
+        return {
+            "verified_at": "2026-08-03T00:00:00.000+00:00",
+            "provider": "opencode-go",
+            "models": {
+                reviewer.model_id: {
+                    "status": "active",
+                    "variants": [reviewer.variant] if reviewer.variant else [],
                 }
+                for reviewer in reviewers
+            },
+        }
+
+    @staticmethod
+    def write_config(path: Path, count: int) -> Path:
+        reviewers = []
+        for index in range(1, count + 1):
+            reviewers.append(
+                {
+                    "key": f"reviewer-{index}",
+                    "display_name": f"Reviewer {index}",
+                    "model_id": f"opencode-go/model-{index}",
+                    "variant": "max",
+                }
+            )
+        path.write_text(
+            json.dumps(
+                {"schema_version": 1, "provider": "opencode-go", "reviewers": reviewers}
             ),
             encoding="utf-8",
         )
-        return marker
+        return path
 
-    def make_fake_agent(self, directory: Path) -> Path:
-        fake = directory / "fake-agent"
+    @staticmethod
+    def make_fake_opencode(
+        root: Path,
+        embedded_config: Path | None = None,
+    ) -> Path:
+        fake = root / "opencode"
+        embedded_reviewers = (
+            embedded_config.read_text(encoding="utf-8")
+            if embedded_config is not None
+            else json.dumps({"reviewers": []})
+        )
         fake.write_text(
             textwrap.dedent(
                 f"""\
@@ -78,49 +103,75 @@ class RunnerTestCase(unittest.TestCase):
                 import sys
                 import time
 
-                if len(sys.argv) > 1 and sys.argv[1] == "status":
-                    print(os.environ.get("FAKE_AGENT_STATUS_OUTPUT", "Logged in"))
-                    raise SystemExit(
-                        int(os.environ.get("FAKE_AGENT_STATUS_CODE", "0"))
-                    )
-
-                if (
-                    os.environ.get("FAIL_IF_WEBHOOK_VISIBLE")
-                    and os.environ.get("MONJU_NOTIFY_WEBHOOK_URL")
-                ):
-                    print("webhook secret leaked to reviewer", file=sys.stderr)
-                    raise SystemExit(86)
-
-                if os.environ.get("FAKE_AGENT_STARTUP_FAILURE"):
-                    print(
-                        os.environ["FAKE_AGENT_STARTUP_FAILURE"],
-                        file=sys.stderr,
-                    )
-                    raise SystemExit(76)
-
-                model = sys.argv[sys.argv.index("--model") + 1]
-                reported = {{
-                    "kimi-k3-max": "Kimi K3 Max",
-                    "cursor-grok-4.5-high": "Cursor Grok 4.5 High",
-                    "claude-fable-5-thinking-max": "Fable 5 300K Max",
-                }}[model]
-                if os.environ.get("FAKE_AGENT_BAD_MODEL") == model:
-                    reported = os.environ.get(
-                        "FAKE_AGENT_REPORTED_MODEL",
-                        "Grok 5.4 High",
-                    )
-                print(json.dumps({{
-                    "type": "system",
-                    "subtype": "init",
-                    "model": reported,
-                    "session_id": "session-" + model,
-                }}), flush=True)
-                time.sleep(float(os.environ.get("FAKE_AGENT_SLEEP", "0")))
-                print(json.dumps({{
-                    "type": "result",
-                    "subtype": "success",
-                    "result": {REVIEW_TEXT!r},
-                }}), flush=True)
+                args = sys.argv[1:]
+                if args == ["auth", "list"]:
+                    if os.environ.get("FAKE_OPENCODE_NO_AUTH"):
+                        print("0 credentials")
+                    else:
+                        print("OpenCode Go api\\n1 credentials")
+                    raise SystemExit(0)
+                if len(args) >= 2 and args[:2] == ["models", "opencode-go"]:
+                    if os.environ.get("FAKE_OPENCODE_MODELS_FAIL"):
+                        print("Provider not found: opencode-go")
+                        raise SystemExit(1)
+                    config = json.loads(os.environ.get("FAKE_REVIEWERS_JSON", {embedded_reviewers!r}))
+                    for item in config["reviewers"]:
+                        if os.environ.get("FAKE_OPENCODE_DROP_MODEL") == item["model_id"]:
+                            continue
+                        variants = {{item.get("variant") or "default": {{}}}}
+                        if os.environ.get("FAKE_OPENCODE_DROP_VARIANT") == item["model_id"]:
+                            variants = {{}}
+                        print(item["model_id"])
+                        print(json.dumps({{
+                            "id": item["model_id"].split("/", 1)[1],
+                            "providerID": "opencode-go",
+                            "status": "active",
+                            "variants": variants,
+                        }}))
+                    raise SystemExit(0)
+                if "run" not in args:
+                    print("unsupported fake command", file=sys.stderr)
+                    raise SystemExit(64)
+                if "--auto" in args or "--pure" not in args or "--format" not in args:
+                    print("unsafe or incomplete command", file=sys.stderr)
+                    raise SystemExit(65)
+                if "--agent" not in args or args[args.index("--agent") + 1] != "monju-review":
+                    print("missing monju agent", file=sys.stderr)
+                    raise SystemExit(66)
+                if os.environ.get("MONJU_NOTIFY_WEBHOOK_URL"):
+                    print("webhook secret leaked", file=sys.stderr)
+                    raise SystemExit(67)
+                agent = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])["agent"]["monju-review"]
+                permission = agent["permission"]
+                if permission["*"] != "deny" or permission["read"]["*.env"] != "deny":
+                    print("permissions are not read-only", file=sys.stderr)
+                    raise SystemExit(68)
+                prompt = sys.stdin.read()
+                if "<BEGIN_MONJU_REVIEW_BRIEF>" not in prompt:
+                    print("prompt was not supplied on stdin", file=sys.stderr)
+                    raise SystemExit(69)
+                if any("BEGIN_MONJU" in arg for arg in args):
+                    print("prompt leaked to argv", file=sys.stderr)
+                    raise SystemExit(70)
+                model = args[args.index("--model") + 1]
+                time.sleep(float(os.environ.get("FAKE_OPENCODE_SLEEP", "0")))
+                session = "session-" + model.rsplit("/", 1)[-1]
+                if os.environ.get("FAKE_OPENCODE_REGION_ERROR_MODEL") == model:
+                    error = {{
+                        "name": "APIError",
+                        "data": {{
+                            "message": "The latest version of this model is only available hosted in China and requires explicit opt in",
+                            "statusCode": 403,
+                            "isRetryable": False,
+                            "responseBody": json.dumps({{"type": "error", "error": {{"type": "RegionError"}}}}),
+                        }},
+                    }}
+                    print(json.dumps({{"type": "error", "sessionID": session, "error": error}}), flush=True)
+                    raise SystemExit(1)
+                if os.environ.get("FAKE_OPENCODE_ERROR_MODEL") == model:
+                    print(json.dumps({{"type": "error", "sessionID": session, "error": {{"name": "ProviderError", "data": {{"message": "simulated OpenCode error"}}}}}}), flush=True)
+                    raise SystemExit(1)
+                print(json.dumps({{"type": "text", "sessionID": session, "part": {{"type": "text", "text": {REVIEW_TEXT!r}}}}}), flush=True)
                 """
             ),
             encoding="utf-8",
@@ -128,23 +179,79 @@ class RunnerTestCase(unittest.TestCase):
         fake.chmod(0o755)
         return fake
 
+    @staticmethod
+    def make_fake_tmux(root: Path) -> Path:
+        fake = root / "tmux"
+        pid_file = root / "fake-tmux-session.pid"
+        argv_file = root / "fake-tmux-new-session.json"
+        fake.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                pid_file = Path({str(pid_file)!r})
+                argv_file = Path({str(argv_file)!r})
+                args = sys.argv[1:]
+                if args and args[0] == "list-sessions":
+                    print("persistent-test-session")
+                    raise SystemExit(0)
+                if args and args[0] == "has-session":
+                    try:
+                        pid = int(pid_file.read_text())
+                        os.kill(pid, 0)
+                    except (OSError, ValueError):
+                        print("can't find session", file=sys.stderr)
+                        raise SystemExit(1)
+                    raise SystemExit(0)
+                if args and args[0] == "new-session":
+                    argv_file.write_text(json.dumps(args))
+                    command = args[args.index("-c") + 2:]
+                    environment = os.environ.copy()
+                    environment["TMUX"] = "/private/tmp/fake-tmux,1,0"
+                    process = subprocess.Popen(
+                        command,
+                        env=environment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    pid_file.write_text(str(process.pid))
+                    raise SystemExit(0)
+                print("unsupported fake tmux command", file=sys.stderr)
+                raise SystemExit(64)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake
+
+    def command_env(self, home: Path, config: Path, **extra: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["FAKE_REVIEWERS_JSON"] = config.read_text(encoding="utf-8")
+        env.update(extra)
+        return env
+
     def run_command(
         self,
-        *arguments: str,
+        home: Path,
+        config: Path,
+        *args: str,
         env: dict[str, str] | None = None,
-        timeout: float = 10,
-        trusted_workspace: bool = True,
+        timeout: float = 20,
     ) -> subprocess.CompletedProcess[str]:
-        command_env = os.environ.copy()
-        command_env["AGENT_CLI_CREDENTIAL_STORE"] = "file"
-        command_env["HOME"] = str(self.test_home)
+        command_env = self.command_env(home, config)
         if env:
             command_env.update(env)
-        if trusted_workspace and "--workspace" in arguments:
-            workspace = Path(arguments[arguments.index("--workspace") + 1])
-            self.trust_workspace(workspace, Path(command_env["HOME"]))
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
+            [sys.executable, str(SCRIPT), "--reviewers-file", str(config), *args],
             cwd=REPOSITORY,
             env=command_env,
             text=True,
@@ -158,1599 +265,1068 @@ class RunnerTestCase(unittest.TestCase):
         prefix = f"{key}="
         for line in output.splitlines():
             if line.startswith(prefix):
-                return line.removeprefix(prefix)
-        raise AssertionError(f"{key} not found in output:\n{output}")
+                return line[len(prefix):]
+        raise AssertionError(f"missing {key} in output:\n{output}")
 
-    def prepare(self, workspace: Path, output_root: Path) -> tuple[Path, Path]:
+    def prepare(self, root: Path, workspace: Path, config: Path) -> tuple[Path, Path]:
         result = self.run_command(
+            root / "home",
+            config,
             "--prepare",
             "--workspace",
             str(workspace),
             "--output-root",
-            str(output_root),
+            str(root / "reviews"),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return (
-            Path(self.parse_key(result.stdout, "RUN_DIR")),
-            Path(self.parse_key(result.stdout, "PROMPT_FILE")),
+        return Path(self.parse_key(result.stdout, "RUN_DIR")), Path(
+            self.parse_key(result.stdout, "PROMPT_FILE")
         )
+
+    def test_default_configuration_uses_highest_available_variants(self) -> None:
+        reviewers, _ = run_monju.load_reviewer_configuration(REPOSITORY / "reviewers.json")
+        self.assertEqual(
+            [(item.model_id, item.variant) for item in reviewers],
+            [
+                ("opencode-go/kimi-k3", "max"),
+                ("opencode-go/grok-4.5", "high"),
+                ("opencode-go/deepseek-v4-flash", "max"),
+                ("opencode-go/glm-5.2", "max"),
+                ("opencode-go/qwen3.8-max", "max"),
+            ],
+        )
+
+    def test_configuration_supports_one_and_four_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for count in (1, 4):
+                config = self.write_config(root / f"reviewers-{count}.json", count)
+                reviewers, digest = run_monju.load_reviewer_configuration(config)
+                self.assertEqual(len(reviewers), count)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_configuration_rejects_provider_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.write_config(root / "reviewers.json", 2)
+            payload = json.loads(config.read_text(encoding="utf-8"))
+            payload["provider"] = "other"
+            config.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                run_monju.load_reviewer_configuration(config)
+            payload["provider"] = "opencode-go"
+            payload["reviewers"][1]["key"] = payload["reviewers"][0]["key"]
+            config.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                run_monju.load_reviewer_configuration(config)
+
+    def test_configuration_rejects_empty_reviewer_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "reviewers.json"
+            config.write_text(
+                json.dumps({"schema_version": 1, "provider": "opencode-go", "reviewers": []}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit):
+                run_monju.load_reviewer_configuration(config)
+
+    def test_command_and_permissions_are_read_only(self) -> None:
+        reviewer = run_monju.REVIEWERS[0]
+        command = run_monju.build_command("/bin/opencode", reviewer, Path("/workspace"))
+        self.assertEqual(command[:3], ["/bin/opencode", "--pure", "run"])
+        self.assertNotIn("--auto", command)
+        self.assertEqual(command[command.index("--variant") + 1], "max")
+        permission = run_monju.opencode_agent_config()["agent"]["monju-review"]["permission"]
+        self.assertEqual(permission["*"], "deny")
+        self.assertEqual(permission["read"]["*.env"], "deny")
+        self.assertEqual(permission["read"]["*.env.*"], "deny")
+        self.assertEqual(permission["read"]["*.env.example"], "allow")
+
+    def test_tmux_webhook_handoff_is_private_consumed_and_not_in_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "monju-webhook-test"
+            run_dir.mkdir()
+            secret = "https://secret.invalid/token"
+            with mock.patch.dict(
+                os.environ,
+                {run_monju.NOTIFICATION_WEBHOOK_ENV: secret},
+            ):
+                handoff = run_monju.prepare_tmux_webhook_handoff(
+                    run_dir,
+                    run_dir.name,
+                    "auto",
+                )
+                self.assertIsNotNone(handoff)
+                assert handoff is not None
+                self.assertEqual(handoff.stat().st_mode & 0o777, 0o600)
+                args = argparse.Namespace(
+                    reviewers_file=REPOSITORY / "reviewers.json",
+                    timeout_seconds=3600,
+                    notify="auto",
+                )
+                command = run_monju.tmux_supervisor_command(
+                    args,
+                    Path("/workspace"),
+                    run_dir,
+                    run_dir / f"{run_dir.name}-00-review-brief.md",
+                    "/bin/opencode",
+                    run_dir.name,
+                    handoff,
+                )
+                self.assertNotIn(secret, command)
+                run_monju.consume_tmux_webhook_handoff(
+                    handoff,
+                    run_dir,
+                    run_dir.name,
+                )
+                self.assertFalse(handoff.exists())
+                self.assertEqual(
+                    os.environ[run_monju.NOTIFICATION_WEBHOOK_ENV],
+                    secret,
+                )
+
+    def test_event_parser_accepts_text_and_rejects_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "events.jsonl"
+            path.write_text(
+                json.dumps({"type": "text", "sessionID": "s1", "part": {"text": "ok"}})
+                + "\nnot-json\n",
+                encoding="utf-8",
+            )
+            parsed = run_monju.inspect_event_stream(path)
+            self.assertEqual(parsed.final_text, "ok")
+            self.assertEqual(parsed.session_id, "s1")
+            self.assertEqual(parsed.malformed_lines, (2,))
+
+    def test_preflight_validates_auth_models_and_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 3)
+            fake = self.make_fake_opencode(root)
+            fake_tmux = self.make_fake_tmux(root)
+            result = self.run_command(
+                home,
+                config,
+                "--preflight",
+                "--workspace",
+                str(workspace),
+                "--opencode-bin",
+                str(fake),
+                "--tmux-bin",
+                str(fake_tmux),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PREFLIGHT=ok", result.stdout)
+            self.assertIn("REVIEWERS=3", result.stdout)
+
+    def test_preflight_rejects_missing_auth_model_and_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 2)
+            fake = self.make_fake_opencode(root)
+            fake_tmux = self.make_fake_tmux(root)
+            cases = (
+                ({"FAKE_OPENCODE_NO_AUTH": "1"}, "PREFLIGHT=opencode_auth_required"),
+                ({"FAKE_OPENCODE_DROP_MODEL": "opencode-go/model-1"}, "PREFLIGHT=reviewer_model_invalid"),
+                ({"FAKE_OPENCODE_DROP_VARIANT": "opencode-go/model-1"}, "PREFLIGHT=reviewer_model_invalid"),
+            )
+            for environment, expected in cases:
+                with self.subTest(expected=expected):
+                    result = self.run_command(
+                        home,
+                        config,
+                        "--preflight",
+                        "--workspace",
+                        str(workspace),
+                        "--opencode-bin",
+                        str(fake),
+                        "--tmux-bin",
+                        str(fake_tmux),
+                        env=environment,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stderr)
+
+    def test_foreground_run_uses_stdin_and_publishes_dynamic_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 4)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake),
+                env={"MONJU_NOTIFY_WEBHOOK_URL": "https://secret.invalid/token"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertEqual(manifest["backend"], "opencode")
+            self.assertEqual(len(manifest["results"]), 4)
+            self.assertTrue(all(item["model_verified"] for item in manifest["results"]))
+            self.assertEqual(len(list(run_dir.glob("*.terminal.json"))), 4)
+
+    def test_tmux_launch_tracks_session_and_publishes_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            fake_opencode = self.make_fake_opencode(root)
+            fake_tmux = self.make_fake_tmux(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect through tmux.", encoding="utf-8")
+
+            result = self.run_command(
+                home,
+                config,
+                "--tmux",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake_opencode),
+                "--tmux-bin",
+                str(fake_tmux),
+                env={
+                    "FAKE_OPENCODE_SLEEP": "0.5",
+                    "MONJU_NOTIFY_WEBHOOK_URL": "https://secret.invalid/token",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("EXECUTION_MODE=tmux_supervisor", result.stdout)
+            self.assertIn(f"TMUX_SESSION={run_dir.name}", result.stdout)
+
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            deadline = time.monotonic() + 10
+            payload: dict[str, object] | None = None
+            while time.monotonic() < deadline:
+                if manifest_path.is_file():
+                    payload = json.loads(manifest_path.read_text())
+                    if payload.get("status") != "running":
+                        break
+                time.sleep(0.05)
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["status"], "success")
+            self.assertEqual(payload["execution_mode"], "tmux_supervisor")
+            self.assertEqual(payload["tmux_session"], run_dir.name)
+            self.assertTrue(
+                (run_dir / f"{run_dir.name}-runner.stdout.log").is_file()
+            )
+            tmux_argv = (root / "fake-tmux-new-session.json").read_text()
+            self.assertNotIn("https://secret.invalid/token", tmux_argv)
+            self.assertNotIn("Inspect through tmux", tmux_argv)
+
+    def test_tmux_launch_refuses_an_existing_exact_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            fake_opencode = self.make_fake_opencode(root)
+            fake_tmux = self.make_fake_tmux(root)
+            (root / "fake-tmux-session.pid").write_text(str(os.getpid()))
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+
+            result = self.run_command(
+                home,
+                config,
+                "--tmux",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake_opencode),
+                "--tmux-bin",
+                str(fake_tmux),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("tmux session already exists", result.stderr)
+            self.assertFalse((run_dir / ".monju-started").exists())
+
+    @unittest.skipUnless(
+        os.environ.get("MONJU_TEST_REAL_TMUX") == "1",
+        "set MONJU_TEST_REAL_TMUX=1 for the local tmux integration smoke",
+    )
+    def test_real_tmux_smoke_uses_no_external_model(self) -> None:
+        tmux_bin = shutil.which("tmux")
+        self.assertIsNotNone(tmux_bin)
+        assert tmux_bin is not None
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            fake_opencode = self.make_fake_opencode(root, config)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nSynthetic tmux smoke.", encoding="utf-8")
+            try:
+                result = self.run_command(
+                    home,
+                    config,
+                    "--tmux",
+                    "--workspace",
+                    str(workspace),
+                    "--run-dir",
+                    str(run_dir),
+                    "--prompt-file",
+                    str(prompt),
+                    "--opencode-bin",
+                    str(fake_opencode),
+                    "--tmux-bin",
+                    tmux_bin,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+                deadline = time.monotonic() + 15
+                payload: dict[str, object] | None = None
+                while time.monotonic() < deadline:
+                    if manifest_path.is_file():
+                        payload = json.loads(manifest_path.read_text())
+                        if payload.get("status") != "running":
+                            break
+                    time.sleep(0.05)
+                self.assertIsNotNone(payload)
+                assert payload is not None
+                self.assertEqual(payload["status"], "success")
+                self.assertEqual(payload["execution_mode"], "tmux_supervisor")
+                self.assertEqual(payload["tmux_session"], run_dir.name)
+            finally:
+                subprocess.run(
+                    [tmux_bin, "kill-session", "-t", f"={run_dir.name}"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+
+    def test_one_opencode_error_produces_partial_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 3)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake),
+                env={"FAKE_OPENCODE_ERROR_MODEL": "opencode-go/model-2"},
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
+            self.assertEqual(manifest["status"], "partial_failure")
+
+    def test_deepseek_region_error_is_an_expected_partial_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = REPOSITORY / "reviewers.json"
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake),
+                env={
+                    "FAKE_OPENCODE_REGION_ERROR_MODEL":
+                        "opencode-go/deepseek-v4-flash"
+                },
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
+            self.assertEqual(manifest["status"], "partial_failure")
+            deepseek = next(
+                item
+                for item in manifest["results"]
+                if item["requested_model"] == "opencode-go/deepseek-v4-flash"
+            )
+            self.assertEqual(deepseek["status"], "failed")
+            self.assertIn("only available hosted in China", deepseek["error"])
+            self.assertEqual(
+                sum(item["status"] == "success" for item in manifest["results"]),
+                4,
+            )
+
+    def test_reviewer_timeout_is_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake),
+                "--timeout-seconds",
+                "1",
+                env={"FAKE_OPENCODE_SLEEP": "5"},
+            )
+            self.assertEqual(result.returncode, 4, result.stderr)
+            manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
+            self.assertTrue(manifest["results"][0]["timed_out"])
 
     def make_recovery_run(
         self,
         root: Path,
         *,
-        terminal_states: dict[str, str] | None = None,
-        reported_models: dict[str, str] | None = None,
+        states: dict[str, str] | None = None,
         supervisor_pid: int = 2_147_483_647,
     ) -> tuple[Path, Path]:
+        reviewers = run_monju.REVIEWERS
         run_id = f"monju-recovery-{time.time_ns()}"
         run_dir = root / run_id
-        workspace = root / f"{run_id}-workspace"
-        staging_parent = root / f"{run_id}-staging-test"
-        staging_dir = staging_parent / run_id
+        workspace = root / "workspace"
+        staging_dir = root / f"{run_id}-staging-test" / run_id
         run_dir.mkdir()
-        workspace.mkdir()
+        workspace.mkdir(exist_ok=True)
         staging_dir.mkdir(parents=True)
         prompt = run_dir / f"{run_id}-00-review-brief.md"
         prompt.write_text("# Review\nInspect preserved results.", encoding="utf-8")
         review_brief, effective_prompt = run_monju.read_review_brief(prompt)
-        run_monju.copy_prompt_artifacts(
-            staging_dir,
-            run_id,
-            review_brief,
-            effective_prompt,
-        )
-        prompt_hash = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
+        run_monju.copy_prompt_artifacts(staging_dir, run_id, review_brief, effective_prompt)
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
+            "backend": "opencode",
+            "provider": "opencode-go",
             "run_id": run_id,
             "status": "running",
-            "started_at": "2026-07-29T13:14:53.695+00:00",
+            "started_at": "2026-08-03T00:00:00.000+00:00",
             "completed_at": None,
             "workspace": str(workspace),
             "source_prompt_file": str(prompt),
-            "effective_prompt_sha256": prompt_hash,
-            "reasoning_policy": run_monju.REASONING_POLICY,
-            "parallel_reviewer_count": len(run_monju.REVIEWERS),
+            "effective_prompt_sha256": hashlib.sha256(effective_prompt.encode()).hexdigest(),
+            "reviewers": run_monju.reviewers_payload(reviewers),
+            "reviewer_config_sha256": run_monju.REVIEWER_CONFIG_HASH,
+            "catalog_verification": run_monju.CATALOG_VERIFICATION,
+            "parallel_reviewer_count": len(reviewers),
             "execution_mode": run_monju.EXECUTION_MODE,
             "supervisor_pid": supervisor_pid,
             "notification": run_monju.notification_pending("none"),
             "results": [],
         }
-        run_monju.write_json_atomic(
-            run_dir / f"{run_id}-manifest.json",
-            manifest,
-        )
-        run_monju.atomic_write_text(
-            run_dir / f"{run_id}-runner.pid",
-            f"{supervisor_pid}\n",
-        )
-        run_monju.atomic_write_text(
-            run_dir / f".{run_id}-staging",
-            f"{staging_dir}\n",
-        )
-
-        states = terminal_states or {}
-        model_overrides = reported_models or {}
-        for reviewer in run_monju.REVIEWERS:
-            state = states.get(reviewer.key, "success")
-            events, stderr, _ = run_monju.reviewer_artifact_paths(
-                staging_dir,
-                run_id,
-                reviewer,
-            )
-            lines = [
-                json.dumps(
-                    {
-                        "type": "system",
-                        "subtype": "init",
-                        "model": model_overrides.get(
-                            reviewer.key,
-                            reviewer.allowed_reported_models[-1],
-                        ),
-                        "session_id": f"session-{reviewer.key}",
-                    }
-                )
-            ]
-            if state == "success":
-                lines.append(
-                    json.dumps(
-                        {
-                            "type": "result",
-                            "subtype": "success",
-                            "is_error": False,
-                            "duration_ms": 1234,
-                            "result": REVIEW_TEXT,
-                        }
-                    )
-                )
-            elif state == "cursor_error":
-                lines.append(
-                    json.dumps(
-                        {
-                            "type": "result",
-                            "subtype": "error",
-                            "is_error": True,
-                            "duration_ms": 1234,
-                            "result": "simulated Cursor error",
-                        }
-                    )
-                )
+        run_monju.write_json_atomic(run_dir / f"{run_id}-manifest.json", manifest)
+        run_monju.atomic_write_text(run_dir / f"{run_id}-runner.pid", f"{supervisor_pid}\n")
+        run_monju.atomic_write_text(run_dir / f".{run_id}-staging", f"{staging_dir}\n")
+        for reviewer in reviewers:
+            state = (states or {}).get(reviewer.key, "success")
+            events, stderr, _ = run_monju.reviewer_artifact_paths(staging_dir, run_id, reviewer)
+            if state == "error":
+                event = {"type": "error", "sessionID": f"s-{reviewer.key}", "error": {"data": {"message": "simulated error"}}}
+                exit_code = 1
+            elif state == "progress":
+                event = {
+                    "type": "text",
+                    "sessionID": f"s-{reviewer.key}",
+                    "part": {"text": "I will inspect the remaining files next."},
+                }
+                exit_code = 0
             elif state == "malformed":
-                lines.extend(
-                    [
-                        "{malformed",
-                        json.dumps(
-                            {
-                                "type": "result",
-                                "subtype": "success",
-                                "is_error": False,
-                                "result": REVIEW_TEXT,
-                            }
-                        ),
-                    ]
-                )
-            elif state != "incomplete":
-                raise AssertionError(f"unsupported terminal state: {state}")
-            events.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                events.write_text("not-json\n", encoding="utf-8")
+                event = None
+                exit_code = 0
+            else:
+                event = {"type": "text", "sessionID": f"s-{reviewer.key}", "part": {"text": REVIEW_TEXT}}
+                exit_code = 0
+            if event is not None:
+                events.write_text(json.dumps(event) + "\n", encoding="utf-8")
             stderr.write_text("", encoding="utf-8")
+            if state != "incomplete":
+                marker = {
+                    "schema_version": 1,
+                    "completed": True,
+                    "run_id": run_id,
+                    "ordinal": reviewer.ordinal,
+                    "reviewer_key": reviewer.key,
+                    "model_id": reviewer.model_id,
+                    "variant": reviewer.variant,
+                    "reviewer_config_sha256": run_monju.REVIEWER_CONFIG_HASH,
+                    "started_at": "2026-08-03T00:00:00.000+00:00",
+                    "completed_at": "2026-08-03T00:01:00.000+00:00",
+                    "duration_seconds": 60.0,
+                    "exit_code": exit_code,
+                    "timed_out": False,
+                    "interrupted_signal": None,
+                    "launch_error": None,
+                    "events_size": events.stat().st_size,
+                    "events_sha256": run_monju.file_sha256(events),
+                    "stderr_size": stderr.stat().st_size,
+                    "stderr_sha256": run_monju.file_sha256(stderr),
+                }
+                if state == "bad_hash":
+                    marker["events_sha256"] = "0" * 64
+                run_monju.write_json_atomic(
+                    run_monju.terminal_marker_path(staging_dir, run_id, reviewer), marker
+                )
         return run_dir, staging_dir
 
     @staticmethod
-    def recovery_args(
-        run_dir: Path,
-        *,
-        notify: str = "none",
-    ) -> SimpleNamespace:
-        return SimpleNamespace(run_dir=run_dir, notify=notify)
+    def recovery_args(run_dir: Path, notify: str = "none") -> argparse.Namespace:
+        return argparse.Namespace(run_dir=run_dir, notify=notify)
 
-    def wait_for_terminal_manifest(self, run_dir: Path, timeout: float = 8) -> dict:
-        manifest = run_dir / f"{run_dir.name}-manifest.json"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if manifest.is_file():
-                payload = json.loads(manifest.read_text(encoding="utf-8"))
-                notification = payload.get("notification", {})
-                if (
-                    payload.get("status") != "running"
-                    and notification.get("status") != "pending"
-                ):
-                    return payload
-            time.sleep(0.05)
-        self.fail(f"run did not finish: {run_dir}")
-
-    def test_model_verification_requires_quality_markers(self) -> None:
-        kimi, grok, fable = run_monju.REVIEWERS
-        self.assertTrue(run_monju.model_matches(kimi, "Kimi K3 Max"))
-        self.assertTrue(run_monju.model_matches(kimi, "kimi-k3-max"))
-        self.assertTrue(run_monju.model_matches(grok, "Cursor Grok 4.5 High"))
-        self.assertTrue(run_monju.model_matches(fable, "Fable 5 300K Max"))
-        self.assertFalse(run_monju.model_matches(kimi, "Kimi K3"))
-        self.assertFalse(run_monju.model_matches(kimi, "Kimi K30 Max"))
-        self.assertFalse(run_monju.model_matches(kimi, "Kimi K3.5 Max"))
-        self.assertFalse(run_monju.model_matches(grok, "Grok 4.5 High"))
-        self.assertFalse(run_monju.model_matches(grok, "Grok 5.4 High"))
-        self.assertFalse(run_monju.model_matches(grok, "Grok 4.5 Mini"))
-        self.assertFalse(run_monju.model_matches(grok, "Grok 4.50 High"))
-        self.assertFalse(run_monju.model_matches(grok, "Grok 4.5 SuperFast High"))
-        self.assertFalse(run_monju.model_matches(fable, "Fable 5 Max"))
-        self.assertFalse(run_monju.model_matches(fable, "Fable 5.5 Max"))
-        self.assertFalse(run_monju.model_matches(fable, "Fable 6 Max"))
-        self.assertFalse(run_monju.model_matches(fable, "Fable 50 Max"))
-        self.assertFalse(run_monju.has_forbidden_variant("fast=false"))
-
-    def test_prompt_envelope_requires_yagni_disposition(self) -> None:
-        prompt = run_monju.PROMPT_ENVELOPE.format(review_brief="Review this change.")
-        self.assertIn("## Act now", prompt)
-        self.assertIn("## Usually defer (YAGNI)", prompt)
-        self.assertIn("include only Act-now work by default", prompt)
-        self.assertIn("not spacecraft code", prompt)
-        self.assertIn("Do not use YAGNI to downgrade", prompt)
-        self.assertIn("small, localized correction", prompt)
-        self.assertIn("purely stylistic preferences", prompt)
-        self.assertIn("expected decision value", prompt)
-
-    def test_parser_retains_diagnostics_but_rejects_non_json_noise(self) -> None:
+    def test_recover_publishes_success_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            events = Path(temporary) / "events.jsonl"
-            events.write_text(
-                "\n".join(
-                    [
-                        "wrapper warning",
-                        json.dumps(
-                            {
-                                "type": "system",
-                                "subtype": "init",
-                                "model": "Kimi K3 Max",
-                                "session_id": "abc",
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "result",
-                                "subtype": "success",
-                                "result": REVIEW_TEXT,
-                            }
-                        ),
-                    ]
+            run_dir, _ = self.make_recovery_run(Path(temporary))
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = run_monju.recover_review(self.recovery_args(run_dir))
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            before = manifest_path.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                second = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual((first, second), (0, 0))
+            self.assertEqual(manifest_path.read_bytes(), before)
+            payload = json.loads(before)
+            self.assertTrue(payload["recovered"])
+            self.assertEqual(payload["status"], "success")
+
+    def test_recover_missing_marker_is_not_ready_and_hash_mismatch_is_invalid(self) -> None:
+        for state, expected in (("incomplete", "recovery_not_ready"), ("bad_hash", "recovery_invalid")):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                key = run_monju.REVIEWERS[-1].key
+                run_dir, staging = self.make_recovery_run(Path(temporary), states={key: state})
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = run_monju.recover_review(self.recovery_args(run_dir))
+                self.assertNotEqual(code, 0)
+                self.assertIn(f"STATUS={expected}", stdout.getvalue())
+                self.assertTrue(staging.is_dir())
+
+    def test_recover_error_stream_is_partial_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = run_monju.REVIEWERS[0].key
+            run_dir, _ = self.make_recovery_run(Path(temporary), states={key: "error"})
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 3)
+            payload = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
+            self.assertEqual(payload["status"], "partial_failure")
+
+    def test_progress_only_text_is_not_a_successful_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = run_monju.REVIEWERS[0].key
+            run_dir, _ = self.make_recovery_run(
+                Path(temporary), states={key: "progress"}
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 3)
+            payload = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text()
+            )
+            result = payload["results"][0]
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("omitted required section", result["error"])
+
+    def test_recovery_uses_frozen_manifest_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original_reviewers = run_monju.REVIEWERS
+            original_hash = run_monju.REVIEWER_CONFIG_HASH
+            original_catalog = run_monju.CATALOG_VERIFICATION
+            run_dir, _ = self.make_recovery_run(Path(temporary))
+            replacement = (
+                run_monju.Reviewer(
+                    ordinal=1,
+                    key="replacement",
+                    display_name="Replacement",
+                    model_id="opencode-go/replacement",
+                    variant="max",
                 ),
-                encoding="utf-8",
             )
-            model, session, final, error, warnings = run_monju.parse_event_stream(
-                events
+            run_monju.configure_reviewers(
+                replacement,
+                run_monju.reviewer_config_hash(replacement),
             )
-            self.assertEqual(model, "Kimi K3 Max")
-            self.assertEqual(session, "abc")
-            self.assertEqual(final, REVIEW_TEXT)
-            self.assertIsNone(error)
-            self.assertEqual(len(warnings), 1)
-            parsed = run_monju.inspect_event_stream(events)
-            self.assertTrue(parsed.malformed_lines)
-            self.assertTrue(
-                any(
-                    "malformed Cursor event stream" in item
-                    for item in run_monju.parsed_review_errors(
-                        run_monju.REVIEWERS[0],
-                        parsed,
-                    )
+            run_monju.CATALOG_VERIFICATION = self.catalog_for(replacement)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = run_monju.recover_review(self.recovery_args(run_dir))
+                payload = json.loads(
+                    (run_dir / f"{run_dir.name}-manifest.json").read_text()
                 )
+            finally:
+                run_monju.configure_reviewers(original_reviewers, original_hash)
+                run_monju.CATALOG_VERIFICATION = original_catalog
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                [item["key"] for item in payload["reviewers"]],
+                [item.key for item in original_reviewers],
             )
 
-    def test_heartbeat_flushes_safe_liveness_output_at_interval(self) -> None:
-        class FlushRecorder(io.StringIO):
-            def __init__(self) -> None:
-                super().__init__()
-                self.flush_count = 0
-
-            def flush(self) -> None:
-                self.flush_count += 1
-                super().flush()
-
-        output = FlushRecorder()
-        heartbeat = run_monju.SupervisorHeartbeat(
-            "monju-heartbeat-test",
-            interval_seconds=0.01,
-            output=output,
-        )
-        with heartbeat:
-            time.sleep(0.035)
-
-        lines = output.getvalue().splitlines()
-        self.assertGreaterEqual(len(lines), 2)
-        self.assertGreaterEqual(output.flush_count, len(lines))
-        self.assertTrue(
-            all(
-                line.startswith(
-                    "MONJU_HEARTBEAT run_id=monju-heartbeat-test "
-                    "elapsed_seconds="
-                )
-                for line in lines
-            )
-        )
-        self.assertNotIn("private prompt", output.getvalue())
-        self.assertNotIn("/secret/workspace", output.getvalue())
-        self.assertNotIn("webhook-token", output.getvalue())
-
-    def test_heartbeat_thread_stops_after_normal_completion(self) -> None:
-        heartbeat = run_monju.SupervisorHeartbeat(
-            "monju-normal-stop",
-            interval_seconds=0.01,
-            output=io.StringIO(),
-        )
-        self.assertFalse(heartbeat.daemon)
-        with heartbeat:
-            self.assertTrue(heartbeat.is_alive)
-        self.assertFalse(heartbeat.is_alive)
-
-    def test_foreground_supervisor_uses_and_stops_heartbeat(self) -> None:
+    def test_recover_refuses_live_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            run_dir = root / "monju-heartbeat-integration"
-            workspace.mkdir()
-            run_dir.mkdir()
-            fake = self.make_fake_agent(root)
-            prompt = run_dir / f"{run_dir.name}-00-review-brief.md"
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            review_brief, effective_prompt = run_monju.read_review_brief(prompt)
+            run_dir, staging = self.make_recovery_run(
+                Path(temporary), supervisor_pid=os.getpid()
+            )
             stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 65)
+            self.assertIn("STATUS=recovery_refused", stdout.getvalue())
+            self.assertTrue(staging.is_dir())
 
+    def test_recover_refuses_live_tmux_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            payload = json.loads(manifest_path.read_text())
+            payload["execution_mode"] = run_monju.TMUX_EXECUTION_MODE
+            payload["tmux_session"] = run_dir.name
+            run_monju.write_json_atomic(manifest_path, payload)
+            stdout = io.StringIO()
             with (
                 mock.patch.object(
                     run_monju,
-                    "HEARTBEAT_INTERVAL_SECONDS",
-                    0.01,
+                    "resolve_tmux_executable",
+                    return_value="/bin/tmux",
                 ),
-                mock.patch.dict(
-                    os.environ,
-                    {"FAKE_AGENT_SLEEP": "0.05"},
-                    clear=False,
+                mock.patch.object(
+                    run_monju,
+                    "tmux_session_is_running",
+                    return_value=True,
                 ),
                 contextlib.redirect_stdout(stdout),
             ):
-                exit_code = run_monju.execute_reviews(
-                    workspace=workspace,
-                    prompt_file=prompt,
-                    run_dir=run_dir,
-                    run_id=run_dir.name,
-                    agent_bin=str(fake),
-                    timeout_seconds=5,
-                    review_brief=review_brief,
-                    effective_prompt=effective_prompt,
-                    run_started_at=run_monju.iso_now(),
-                    notification_mode="none",
-                )
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 65)
+            self.assertIn("STATUS=recovery_refused", stdout.getvalue())
+            self.assertIn("tmux supervisor session is still running", stdout.getvalue())
+            self.assertTrue(staging.is_dir())
 
-            self.assertEqual(exit_code, 0)
-            self.assertIn(
-                "MONJU_HEARTBEAT "
-                "run_id=monju-heartbeat-integration elapsed_seconds=",
-                stdout.getvalue(),
-            )
-            self.assertFalse(
-                any(
-                    thread.name == "monju-heartbeat-monju-heartbeat-integration"
-                    for thread in threading.enumerate()
-                )
-            )
-
-    def test_heartbeat_thread_stops_after_sigterm_equivalent_exception(self) -> None:
-        heartbeat = run_monju.SupervisorHeartbeat(
-            "monju-signal-stop",
-            interval_seconds=0.01,
-            output=io.StringIO(),
-        )
-        with self.assertRaises(run_monju.RunInterrupted):
-            with heartbeat:
-                raise run_monju.RunInterrupted(signal.SIGTERM)
-        self.assertFalse(heartbeat.is_alive)
-
-    def test_foreground_run_publishes_three_reviews(self) -> None:
+    def test_recover_tmux_uses_session_identity_not_reused_pid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            run_dir = Path(self.parse_key(result.stdout, "RUN_DIR"))
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "success")
-            self.assertEqual(manifest["notification"]["status"], "disabled")
-            self.assertEqual(len(manifest["results"]), 3)
-            self.assertEqual(len(list(run_dir.glob(f"{run_dir.name}-0[1-3]-*.md"))), 3)
-
-    def test_model_mismatch_produces_partial_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-                env={
-                    "FAKE_AGENT_BAD_MODEL": "cursor-grok-4.5-high",
-                    "FAKE_AGENT_REPORTED_MODEL": "Grok 5.4 High",
-                },
-            )
-
-            self.assertEqual(result.returncode, 3, result.stderr)
-            run_dir = Path(self.parse_key(result.stdout, "RUN_DIR"))
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "partial_failure")
-            results = {
-                item["reviewer"]: item for item in manifest["results"]
-            }
-            self.assertEqual(results["Grok 4.5"]["status"], "failed")
-            self.assertFalse(results["Grok 4.5"]["model_verified"])
-
-    def test_reviewer_timeout_is_a_visible_total_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-                "--timeout-seconds",
-                "1",
-                env={"FAKE_AGENT_SLEEP": "5"},
-            )
-
-            self.assertEqual(result.returncode, 4, result.stderr)
-            run_dir = Path(self.parse_key(result.stdout, "RUN_DIR"))
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "failure")
-            self.assertTrue(all(item["timed_out"] for item in manifest["results"]))
-
-    def test_authentication_failure_stops_before_reviewers_start(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-                env={"FAKE_AGENT_STATUS_OUTPUT": "Not logged in"},
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("file credential store is not authenticated", result.stderr)
-            self.assertEqual(list(output.glob("*/*.events.jsonl")), [])
-
-    def test_preflight_checks_state_trust_and_authentication(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-
-            result = self.run_command(
-                "--preflight",
-                "--workspace",
-                str(workspace),
-                "--agent-bin",
-                str(fake),
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("PREFLIGHT=ok", result.stdout)
-            self.assertIn("WORKSPACE_TRUST=", result.stdout)
-
-    def test_preflight_reports_unwritable_cursor_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            blocked_home = root / "blocked-home"
-            blocked_home.write_text("not a directory", encoding="utf-8")
-
-            result = self.run_command(
-                "--preflight",
-                "--workspace",
-                str(workspace),
-                "--agent-bin",
-                str(fake),
-                env={"HOME": str(blocked_home)},
-                trusted_workspace=False,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("PREFLIGHT=cursor_state_unwritable", result.stderr)
-            self.assertIn("outside the filesystem sandbox", result.stderr)
-
-    def test_preflight_requires_explicit_workspace_trust(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-
-            result = self.run_command(
-                "--preflight",
-                "--workspace",
-                str(workspace),
-                "--agent-bin",
-                str(fake),
-                trusted_workspace=False,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("PREFLIGHT=workspace_trust_required", result.stderr)
-            self.assertIn("agent --workspace", result.stderr)
-            self.assertIn("--trust", result.stderr)
-            self.assertIn("calling coding agent", result.stderr)
-            self.assertNotIn("Run this yourself", result.stderr)
-            self.assertIn("Do not use --yolo or --force", result.stderr)
-
-    def test_auto_notification_prefers_configured_webhook(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            mock.patch.dict(
-                os.environ,
-                {run_monju.NOTIFICATION_WEBHOOK_ENV: "https://example.invalid/hook"},
-            ),
-            mock.patch.object(
-                run_monju,
-                "run_webhook_notification",
-                return_value="webhook",
-            ) as webhook,
-            mock.patch.object(run_monju, "run_desktop_notification") as desktop,
-        ):
-            run_dir = Path(temporary) / "monju-test"
-            result = run_monju.send_completion_notification(
-                "auto",
-                "monju-test",
-                "success",
-                run_dir,
-            )
-
-        self.assertEqual(result.status, "sent")
-        self.assertEqual(result.backend, "webhook")
-        webhook.assert_called_once()
-        desktop.assert_not_called()
-
-    def test_macos_notification_passes_arguments_after_separator(self) -> None:
-        completed = subprocess.CompletedProcess([], 0, "", "")
-        with (
-            mock.patch.object(run_monju.sys, "platform", "darwin"),
-            mock.patch.object(run_monju.shutil, "which", return_value="osascript"),
-            mock.patch.object(
-                run_monju.subprocess,
-                "run",
-                return_value=completed,
-            ) as execute,
-        ):
-            backend = run_monju.run_desktop_notification("Monju", "done")
-
-        self.assertEqual(backend, "macos")
-        command = execute.call_args.args[0]
-        self.assertEqual(command[-3:], ["--", "Monju", "done"])
-        self.assertEqual(command[1:3], ["-l", "JavaScript"])
-        self.assertIn(
-            "app.displayNotification(argv[1], {withTitle: argv[0]})",
-            command[4],
-        )
-
-    @unittest.skipUnless(sys.platform == "darwin", "macOS AppleScript compiler")
-    def test_macos_notification_jxa_compiles(self) -> None:
-        executable = shutil.which("osacompile")
-        if executable is None:
-            self.skipTest("osacompile is unavailable")
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "notification.scpt"
-            result = subprocess.run(
-                [
-                    executable,
-                    "-l",
-                    "JavaScript",
-                    "-e",
-                    run_monju.macos_notification_script(),
-                    "-o",
-                    str(output),
-                ],
-                text=True,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_windows_desktop_notification_targets_current_user(self) -> None:
-        completed = subprocess.CompletedProcess([], 0, "", "")
-        with (
-            mock.patch.object(run_monju.sys, "platform", "win32"),
-            mock.patch.object(run_monju.os, "name", "nt"),
-            mock.patch.dict(run_monju.os.environ, {"USERNAME": "ken"}, clear=False),
-            mock.patch.object(run_monju.shutil, "which", return_value="msg.exe"),
-            mock.patch.object(
-                run_monju.subprocess,
-                "run",
-                return_value=completed,
-            ) as execute,
-        ):
-            backend = run_monju.run_desktop_notification("Monju", "done")
-
-        self.assertEqual(backend, "windows")
-        command = execute.call_args.args[0]
-        self.assertEqual(command[:2], ["msg.exe", "ken"])
-        self.assertNotIn("*", command)
-
-    def test_windows_liveness_probe_never_uses_os_kill(self) -> None:
-        with (
-            mock.patch.object(run_monju.os, "name", "nt"),
-            mock.patch.object(
-                run_monju,
-                "windows_process_is_running",
-                return_value=True,
-            ) as windows_probe,
-            mock.patch.object(run_monju.os, "kill") as kill,
-        ):
-            self.assertTrue(run_monju.process_is_running(1234))
-
-        windows_probe.assert_called_once_with(1234)
-        kill.assert_not_called()
-
-    def test_posix_permission_denied_liveness_probe_is_conservative(self) -> None:
-        with (
-            mock.patch.object(run_monju.os, "name", "posix"),
-            mock.patch.object(
-                run_monju.os,
-                "kill",
-                side_effect=PermissionError("sandbox denied process inspection"),
-            ),
-        ):
-            self.assertTrue(run_monju.process_is_running(1234))
-
-    def test_notification_failure_does_not_change_review_status(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-                "--notify",
-                "webhook",
-                env={run_monju.NOTIFICATION_WEBHOOK_ENV: ""},
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("notification failed", result.stderr)
-            run_dir = Path(self.parse_key(result.stdout, "RUN_DIR"))
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "success")
-            self.assertEqual(manifest["notification"]["requested_mode"], "webhook")
-            self.assertEqual(manifest["notification"]["backend"], "webhook")
-            self.assertEqual(manifest["notification"]["status"], "failed")
-            self.assertIn(
-                run_monju.NOTIFICATION_WEBHOOK_ENV,
-                manifest["notification"]["error"],
-            )
-
-    def test_webhook_secret_is_not_inherited_by_reviewers(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            brief = root / "brief.md"
-            brief.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--prompt-file",
-                str(brief),
-                "--output-root",
-                str(output),
-                "--agent-bin",
-                str(fake),
-                "--notify",
-                "none",
-                env={
-                    run_monju.NOTIFICATION_WEBHOOK_ENV: (
-                        "https://example.invalid/secret-token"
-                    ),
-                    "FAIL_IF_WEBHOOK_VISIBLE": "1",
-                },
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            run_dir = Path(self.parse_key(result.stdout, "RUN_DIR"))
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "success")
-
-    def test_foreground_supervisor_announces_before_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "AGENT_CLI_CREDENTIAL_STORE": "file",
-                    "FAKE_AGENT_SLEEP": "0.7",
-                    "HOME": str(self.test_home),
-                }
-            )
-            self.trust_workspace(workspace, self.test_home)
-            proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--workspace",
-                    str(workspace),
-                    "--run-dir",
-                    str(run_dir),
-                    "--prompt-file",
-                    str(prompt),
-                    "--agent-bin",
-                    str(fake),
-                ],
-                cwd=REPOSITORY,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                manifest_path = run_dir / f"{run_dir.name}-manifest.json"
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    if manifest_path.is_file():
-                        payload = json.loads(
-                            manifest_path.read_text(encoding="utf-8")
-                        )
-                        if payload.get("status") == "running":
-                            break
-                    time.sleep(0.02)
-                else:
-                    self.fail("foreground supervisor never announced running")
-
-                self.assertIsNone(proc.poll())
-                self.assertEqual(
-                    (run_dir / f"{run_dir.name}-runner.pid")
-                    .read_text(encoding="utf-8")
-                    .strip(),
-                    str(proc.pid),
-                )
-                stdout, stderr = proc.communicate(timeout=8)
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait(timeout=5)
-
-            self.assertEqual(proc.returncode, 0, stderr)
-            self.assertIn("STATUS=running", stdout)
-            self.assertIn("EXECUTION_MODE=foreground_supervisor", stdout)
-            self.assertIn("STATUS=success", stdout)
-
-    def test_background_flag_is_rejected_without_claiming_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--background",
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(fake),
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("--background is unsafe under Codex", result.stderr)
-            self.assertFalse((run_dir / ".monju-started").exists())
-            self.assertFalse(
-                (run_dir / f"{run_dir.name}-manifest.json").exists()
-            )
-
-    def test_foreground_reports_immediate_startup_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(fake),
-                env={"FAKE_AGENT_STARTUP_FAILURE": "Workspace Trust Required"},
-            )
-
-            self.assertEqual(result.returncode, 4, result.stderr)
-            self.assertIn("STATUS=failure", result.stdout)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(manifest["status"], "failure")
-            self.assertTrue(
-                all(
-                    "Workspace Trust Required"
-                    in (run_dir / item["stderr_file"]).read_text(encoding="utf-8")
-                    for item in manifest["results"]
-                )
-            )
-
-    def test_foreground_does_not_claim_run_before_trust_preflight(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            for marker in self.test_home.glob(
-                ".cursor/projects/*/.workspace-trusted"
-            ):
-                marker.unlink()
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(fake),
-                trusted_workspace=False,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("PREFLIGHT=workspace_trust_required", result.stderr)
-            self.assertFalse((run_dir / ".monju-started").exists())
-            self.assertFalse(
-                (run_dir / f"{run_dir.name}-manifest.json").exists()
-            )
-
-    def test_second_launch_cannot_replace_claimed_review_brief(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            original = "# Review\nOriginal scope."
-            prompt.write_text(original, encoding="utf-8")
-
-            first = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(fake),
-                env={"FAKE_AGENT_SLEEP": "0.3"},
-            )
-            self.assertEqual(first.returncode, 0, first.stderr)
-
-            replacement = root / "replacement.md"
-            replacement.write_text("# Review\nReplacement scope.", encoding="utf-8")
-            second = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(replacement),
-                "--agent-bin",
-                str(fake),
-            )
-
-            self.assertNotEqual(second.returncode, 0)
-            self.assertIn("already started", second.stderr)
-            self.assertEqual(prompt.read_text(encoding="utf-8").strip(), original)
-            self.assertEqual(self.wait_for_terminal_manifest(run_dir)["status"], "success")
-
-    def test_status_reports_dead_runner_as_stale(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            workspace.mkdir()
-            run_dir, _ = self.prepare(workspace, output)
-            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
-            manifest_path.write_text(
-                json.dumps({"status": "running", "results": []}),
-                encoding="utf-8",
-            )
-            (run_dir / f"{run_dir.name}-runner.pid").write_text(
-                "2147483647\n",
-                encoding="utf-8",
-            )
-
-            status = self.run_command("--status", "--run-dir", str(run_dir))
-
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("STATUS=stale_running", status.stdout)
-            self.assertIn(
-                "STALE_REASON=external_termination_before_startup",
-                status.stdout,
-            )
-
-    def test_status_identifies_external_termination_after_startup(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            staging = root / "staging"
-            workspace.mkdir()
-            staging.mkdir()
-            run_dir, _ = self.prepare(workspace, output)
-            (run_dir / f"{run_dir.name}-manifest.json").write_text(
-                json.dumps({"status": "running", "results": []}),
-                encoding="utf-8",
-            )
-            (run_dir / f"{run_dir.name}-runner.pid").write_text(
-                "2147483647\n",
-                encoding="utf-8",
-            )
-            (run_dir / f".{run_dir.name}-staging").write_text(
-                str(staging),
-                encoding="utf-8",
-            )
-            for reviewer in run_monju.REVIEWERS:
-                stem = (
-                    f"{run_dir.name}-{reviewer.ordinal:02d}-{reviewer.key}"
-                )
-                (staging / f"{stem}.events.jsonl").write_text(
-                    json.dumps(
-                        {
-                            "type": "system",
-                            "subtype": "init",
-                            "model": reviewer.allowed_reported_models[-1],
-                            "session_id": f"session-{reviewer.key}",
-                        }
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-                (staging / f"{stem}.stderr.log").write_text(
-                    "bash: warning: setlocale: LC_ALL: cannot change locale "
-                    "(C.UTF-8): Bad file descriptor\n",
-                    encoding="utf-8",
-                )
-
-            status = self.run_command("--status", "--run-dir", str(run_dir))
-
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("STATUS=stale_running", status.stdout)
-            self.assertIn(
-                "STALE_REASON=external_termination_after_startup",
-                status.stdout,
-            )
-            self.assertIn("initialized:3/3", status.stdout)
-            self.assertIn("startup_errors:0/3", status.stdout)
-            self.assertIn(f"STAGING_PRESERVED={staging}", status.stdout)
-
-    def test_status_identifies_startup_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            output = root / "reviews"
-            staging = root / "staging"
-            workspace.mkdir()
-            staging.mkdir()
-            run_dir, _ = self.prepare(workspace, output)
-            (run_dir / f"{run_dir.name}-manifest.json").write_text(
-                json.dumps({"status": "running", "results": []}),
-                encoding="utf-8",
-            )
-            (run_dir / f"{run_dir.name}-runner.pid").write_text(
-                "2147483647\n",
-                encoding="utf-8",
-            )
-            (run_dir / f".{run_dir.name}-staging").write_text(
-                str(staging),
-                encoding="utf-8",
-            )
-            for reviewer in run_monju.REVIEWERS:
-                stem = (
-                    f"{run_dir.name}-{reviewer.ordinal:02d}-{reviewer.key}"
-                )
-                (staging / f"{stem}.events.jsonl").touch()
-                (staging / f"{stem}.stderr.log").write_text(
-                    "Workspace Trust Required\n",
-                    encoding="utf-8",
-                )
-
-            status = self.run_command("--status", "--run-dir", str(run_dir))
-
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertIn("STATUS=stale_running", status.stdout)
-            self.assertIn("STALE_REASON=startup_failure", status.stdout)
-            self.assertIn("initialized:0/3", status.stdout)
-            self.assertIn("startup_errors:3/3", status.stdout)
-
-    def test_recover_refuses_a_live_supervisor(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, staging = self.make_recovery_run(
+            run_dir, _ = self.make_recovery_run(
                 Path(temporary),
                 supervisor_pid=os.getpid(),
             )
-            before = (
-                run_dir / f"{run_dir.name}-manifest.json"
-            ).read_bytes()
-            stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
-
-            self.assertEqual(exit_code, 65)
-            self.assertIn("STATUS=recovery_refused", stdout.getvalue())
-            self.assertIn(
-                "RECOVERY_REASON=recorded supervisor PID is still running",
-                stdout.getvalue(),
-            )
-            self.assertEqual(
-                (run_dir / f"{run_dir.name}-manifest.json").read_bytes(),
-                before,
-            )
-            self.assertTrue(staging.is_dir())
-
-    def test_recover_requires_preserved_staging_pointer_and_directory(self) -> None:
-        for missing in ("pointer", "directory"):
-            with self.subTest(missing=missing):
-                with tempfile.TemporaryDirectory() as temporary:
-                    run_dir, staging = self.make_recovery_run(Path(temporary))
-                    manifest = run_dir / f"{run_dir.name}-manifest.json"
-                    before = manifest.read_bytes()
-                    if missing == "pointer":
-                        (run_dir / f".{run_dir.name}-staging").unlink()
-                    else:
-                        shutil.rmtree(staging.parent)
-                    stdout = io.StringIO()
-
-                    with contextlib.redirect_stdout(stdout):
-                        exit_code = run_monju.recover_review(
-                            self.recovery_args(run_dir)
-                        )
-
-                    self.assertEqual(exit_code, 65)
-                    self.assertIn("STATUS=recovery_invalid", stdout.getvalue())
-                    self.assertIn("RECOVERY=invalid", stdout.getvalue())
-                    self.assertEqual(manifest.read_bytes(), before)
-
-    def test_recover_is_non_destructive_when_terminal_event_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, staging = self.make_recovery_run(
-                Path(temporary),
-                terminal_states={"fable-5": "incomplete"},
-            )
-            manifest = run_dir / f"{run_dir.name}-manifest.json"
-            before_manifest = manifest.read_bytes()
-            before_run_files = sorted(path.name for path in run_dir.iterdir())
-            before_staging = {
-                path.name: path.read_bytes()
-                for path in staging.iterdir()
-                if path.is_file()
-            }
-            stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
-
-            self.assertEqual(exit_code, 75)
-            self.assertIn("STATUS=recovery_not_ready", stdout.getvalue())
-            self.assertIn("RECOVERY=not_ready", stdout.getvalue())
-            self.assertEqual(manifest.read_bytes(), before_manifest)
-            self.assertEqual(
-                sorted(path.name for path in run_dir.iterdir()),
-                before_run_files,
-            )
-            self.assertEqual(
-                {
-                    path.name: path.read_bytes()
-                    for path in staging.iterdir()
-                    if path.is_file()
-                },
-                before_staging,
-            )
-
-    def test_recover_publishes_three_verified_successes_without_external_calls(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, staging = self.make_recovery_run(Path(temporary))
-            stdout = io.StringIO()
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            payload = json.loads(manifest_path.read_text())
+            payload["execution_mode"] = run_monju.TMUX_EXECUTION_MODE
+            payload["tmux_session"] = run_dir.name
+            run_monju.write_json_atomic(manifest_path, payload)
             with (
-                mock.patch.object(run_monju.subprocess, "Popen") as popen,
                 mock.patch.object(
-                    run_monju.urllib.request,
-                    "urlopen",
-                ) as urlopen,
-                contextlib.redirect_stdout(stdout),
+                    run_monju,
+                    "resolve_tmux_executable",
+                    return_value="/bin/tmux",
+                ),
+                mock.patch.object(
+                    run_monju,
+                    "tmux_session_is_running",
+                    return_value=False,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
             ):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 0)
+            terminal = json.loads(manifest_path.read_text())
+            self.assertEqual(terminal["status"], "success")
 
-            self.assertEqual(exit_code, 0)
-            popen.assert_not_called()
-            urlopen.assert_not_called()
-            self.assertFalse(staging.parent.exists())
-            self.assertFalse(
-                (run_dir / f".{run_dir.name}-staging").exists()
-            )
-            markdown = list(run_dir.glob(f"{run_dir.name}-0[1-3]-*.md"))
-            self.assertEqual(len(markdown), 3)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(manifest["status"], "success")
-            self.assertTrue(manifest["recovered"])
-            self.assertEqual(
-                manifest["recovery_source"],
-                run_monju.RECOVERY_SOURCE,
-            )
-            self.assertEqual(manifest["review_completed_at"], None)
-            self.assertEqual(manifest["notification"]["status"], "disabled")
-            self.assertTrue(
-                all(
-                    result["recovered"]
-                    and result["model_verified"]
-                    and result["status"] == "success"
-                    and result["recovery_validation"]["errors"] == []
-                    for result in manifest["results"]
-                )
-            )
-
-    def test_recover_publishes_cursor_error_as_partial_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, _ = self.make_recovery_run(
-                Path(temporary),
-                terminal_states={"grok-4-5": "cursor_error"},
-            )
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
-
-            self.assertEqual(exit_code, 3)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(manifest["status"], "partial_failure")
-            grok = next(
-                item
-                for item in manifest["results"]
-                if item["reviewer"] == "Grok 4.5"
-            )
-            self.assertEqual(grok["status"], "failed")
-            self.assertIn("simulated Cursor error", grok["error"])
-
-    def test_recover_never_accepts_unknown_or_forbidden_models(self) -> None:
-        cases = ("Unknown Reviewer 9 Max", "Kimi K3 Fast Max")
-        for reported_model in cases:
-            with self.subTest(reported_model=reported_model):
-                with tempfile.TemporaryDirectory() as temporary:
-                    run_dir, _ = self.make_recovery_run(
-                        Path(temporary),
-                        reported_models={"kimi-k3": reported_model},
-                    )
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        exit_code = run_monju.recover_review(
-                            self.recovery_args(run_dir)
-                        )
-                    manifest = json.loads(
-                        (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-
-                self.assertEqual(exit_code, 3)
-                self.assertEqual(manifest["status"], "partial_failure")
-                kimi = next(
-                    item
-                    for item in manifest["results"]
-                    if item["reviewer"] == "Kimi K3"
-                )
-                self.assertEqual(kimi["status"], "failed")
-                self.assertFalse(kimi["model_verified"])
-
-    def test_recover_never_accepts_a_malformed_stream(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, _ = self.make_recovery_run(
-                Path(temporary),
-                terminal_states={"kimi-k3": "malformed"},
-            )
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            self.assertEqual(exit_code, 3)
-            self.assertEqual(manifest["status"], "partial_failure")
-            kimi = next(
-                item
-                for item in manifest["results"]
-                if item["reviewer"] == "Kimi K3"
-            )
-            self.assertEqual(kimi["status"], "failed")
-            self.assertIn("malformed Cursor event stream", kimi["error"])
-
-    def test_recover_is_idempotent_after_terminal_manifest_publication(self) -> None:
+    def test_status_uses_tmux_session_liveness_for_running_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir, _ = self.make_recovery_run(Path(temporary))
-            args = self.recovery_args(run_dir)
-            with contextlib.redirect_stdout(io.StringIO()):
-                first_exit = run_monju.recover_review(args)
             manifest_path = run_dir / f"{run_dir.name}-manifest.json"
-            first_manifest = manifest_path.read_bytes()
-            stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                second_exit = run_monju.recover_review(args)
-
-            self.assertEqual(first_exit, 0)
-            self.assertEqual(second_exit, 0)
-            self.assertEqual(manifest_path.read_bytes(), first_manifest)
-            self.assertIn("STATUS=success", stdout.getvalue())
-            self.assertIn("RECOVERY=published", stdout.getvalue())
-
-    def test_recover_publish_failure_preserves_raw_staging(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, staging = self.make_recovery_run(Path(temporary))
+            payload = json.loads(manifest_path.read_text())
+            payload["execution_mode"] = run_monju.TMUX_EXECUTION_MODE
+            payload["tmux_session"] = run_dir.name
+            run_monju.write_json_atomic(manifest_path, payload)
             stdout = io.StringIO()
             with (
                 mock.patch.object(
                     run_monju,
-                    "publish_staging",
-                    side_effect=PermissionError("simulated recovery publish failure"),
+                    "resolve_tmux_executable",
+                    return_value="/bin/tmux",
+                ),
+                mock.patch.object(
+                    run_monju,
+                    "tmux_session_is_running",
+                    return_value=True,
                 ),
                 contextlib.redirect_stdout(stdout),
+            ):
+                code = run_monju.read_status(self.recovery_args(run_dir))
+            self.assertEqual(code, 0)
+            self.assertIn("STATUS=running", stdout.getvalue())
+            self.assertIn("TMUX_SESSION_ALIVE=yes", stdout.getvalue())
+            self.assertNotIn("STATUS=stale_running", stdout.getvalue())
+
+    def test_status_reports_tmux_starting_before_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            home = root / "home"
+            workspace.mkdir()
+            home.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            run_dir, _ = self.prepare(root, workspace, config)
+            run_monju.atomic_write_text(
+                run_monju.tmux_launch_marker_path(run_dir, run_dir.name),
+                f"{run_dir.name}\n",
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    run_monju,
+                    "resolve_tmux_executable",
+                    return_value="/bin/tmux",
+                ),
+                mock.patch.object(
+                    run_monju,
+                    "tmux_session_is_running",
+                    return_value=True,
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                code = run_monju.read_status(self.recovery_args(run_dir))
+            self.assertEqual(code, 0)
+            self.assertIn("STATUS=tmux_starting", stdout.getvalue())
+            self.assertIn("TMUX_SESSION_ALIVE=yes", stdout.getvalue())
+
+    def test_status_reports_dynamic_recovery_readiness(self) -> None:
+        for state, expected in ((None, "ready"), ("incomplete", "not_ready"), ("bad_hash", "invalid")):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                states = {} if state is None else {run_monju.REVIEWERS[-1].key: state}
+                run_dir, _ = self.make_recovery_run(Path(temporary), states=states)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = run_monju.read_status(self.recovery_args(run_dir))
+                self.assertEqual(code, 0)
+                self.assertIn("STATUS=stale_running", stdout.getvalue())
+                self.assertIn(f"RECOVERY={expected}", stdout.getvalue())
+
+    def test_publish_failure_preserves_recovery_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            with (
+                mock.patch.object(run_monju, "publish_staging", side_effect=PermissionError("no")),
+                contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir)
-                )
-
-            self.assertEqual(exit_code, 74)
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 74)
             self.assertTrue(staging.is_dir())
-            self.assertTrue(
-                (run_dir / f".{run_dir.name}-staging").is_file()
-            )
-            self.assertIn(
-                f"STAGING_PRESERVED={staging.resolve()}",
-                stdout.getvalue(),
-            )
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
+            status_output = io.StringIO()
+            with contextlib.redirect_stdout(status_output):
+                self.assertEqual(
+                    run_monju.read_status(self.recovery_args(run_dir)),
+                    0,
                 )
-            )
-            self.assertEqual(manifest["status"], "artifact_failure")
-            self.assertTrue(manifest["recovered"])
+            self.assertIn("STATUS=artifact_failure", status_output.getvalue())
+            self.assertIn("RECOVERY=ready", status_output.getvalue())
+            self.assertIn("RECOVERY_CAN_PUBLISH=yes", status_output.getvalue())
+            self.assertNotIn("RECOVERY=published", status_output.getvalue())
+            self.assertNotIn("RESULT ", status_output.getvalue())
 
-    def test_recover_notification_failure_does_not_change_review_status(
-        self,
-    ) -> None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                recovered = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(recovered, 0)
+            payload = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text()
+            )
+            self.assertEqual(payload["status"], "success")
+            self.assertEqual(payload["recovery_previous_status"], "artifact_failure")
+            self.assertFalse(staging.parent.exists())
+
+    def test_supervisor_failure_with_complete_staging_can_recover(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            run_dir, _ = self.make_recovery_run(Path(temporary))
+            run_dir, staging = self.make_recovery_run(Path(temporary))
+            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
+            payload = json.loads(manifest_path.read_text())
+            payload.update(
+                {
+                    "status": "supervisor_failure",
+                    "completed_at": "2026-08-03T00:02:00.000+00:00",
+                    "staging_preserved": str(staging),
+                    "supervisor_error": "RuntimeError: simulated",
+                }
+            )
+            run_monju.write_json_atomic(manifest_path, payload)
+
+            status_output = io.StringIO()
+            with contextlib.redirect_stdout(status_output):
+                self.assertEqual(
+                    run_monju.read_status(self.recovery_args(run_dir)),
+                    0,
+                )
+            self.assertIn("RECOVERY=ready", status_output.getvalue())
+            self.assertNotIn("RECOVERY=published", status_output.getvalue())
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                recovered = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(recovered, 0)
+            terminal = json.loads(manifest_path.read_text())
+            self.assertEqual(terminal["status"], "success")
+            self.assertEqual(
+                terminal["recovery_previous_status"],
+                "supervisor_failure",
+            )
+
+    def test_legacy_terminal_manifest_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_id = "monju-legacy-terminal"
+            run_dir = Path(temporary) / run_id
+            run_dir.mkdir()
+            run_monju.write_json_atomic(
+                run_dir / f"{run_id}-manifest.json",
+                {
+                    "schema_version": 2,
+                    "run_id": run_id,
+                    "status": "success",
+                    "results": [],
+                    "notification": run_monju.notification_pending("none"),
+                },
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = run_monju.read_status(self.recovery_args(run_dir))
+            self.assertEqual(code, 0)
+            self.assertIn("STATUS=success", stdout.getvalue())
+            self.assertIn("RECOVERY=published", stdout.getvalue())
+
+    def test_notification_failure_does_not_change_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_id = "monju-notification"
+            run_dir = Path(temporary) / run_id
+            run_dir.mkdir()
+            run_monju.write_json_atomic(
+                run_dir / f"{run_id}-manifest.json",
+                {
+                    "schema_version": 3,
+                    "run_id": run_id,
+                    "status": "success",
+                    "notification": run_monju.notification_pending("desktop"),
+                },
+            )
             with (
                 mock.patch.object(
                     run_monju,
                     "run_desktop_notification",
-                    side_effect=RuntimeError("desktop unavailable"),
+                    side_effect=RuntimeError("unavailable"),
                 ),
-                contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                exit_code = run_monju.recover_review(
-                    self.recovery_args(run_dir, notify="desktop")
-                )
+                run_monju.notify_terminal_status("desktop", run_dir, run_id, "success")
+            payload = json.loads((run_dir / f"{run_id}-manifest.json").read_text())
+            self.assertEqual(payload["status"], "success")
+            self.assertEqual(payload["notification"]["status"], "failed")
 
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(manifest["status"], "success")
-            self.assertEqual(manifest["notification"]["status"], "failed")
-            self.assertEqual(manifest["notification"]["backend"], "desktop")
+    def test_heartbeat_flushes_and_stops_without_secrets(self) -> None:
+        output = FlushRecorder()
+        heartbeat = run_monju.SupervisorHeartbeat(
+            "monju-safe", interval_seconds=0.01, output=output
+        ).start()
+        time.sleep(0.04)
+        heartbeat.stop()
+        content = output.getvalue()
+        self.assertFalse(heartbeat.is_alive)
+        self.assertGreater(output.flush_count, 0)
+        self.assertIn("MONJU_HEARTBEAT run_id=monju-safe", content)
+        self.assertNotIn("secret", content)
 
-    def test_recover_rejects_network_notification_modes_before_writing(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir, staging = self.make_recovery_run(Path(temporary))
-            manifest = run_dir / f"{run_dir.name}-manifest.json"
-            before = manifest.read_bytes()
-
-            with self.assertRaises(SystemExit):
-                run_monju.recover_review(
-                    self.recovery_args(run_dir, notify="webhook")
-                )
-
-            self.assertEqual(manifest.read_bytes(), before)
-            self.assertTrue(staging.is_dir())
-
-    def test_status_reports_recovery_ready_not_ready_and_invalid(self) -> None:
-        cases = (
-            ({}, "ready", "3/3", "yes"),
-            ({"fable-5": "incomplete"}, "not_ready", "2/3", "no"),
-            ({"kimi-k3": "malformed"}, "invalid", "3/3", "yes"),
-        )
-        for states, expected, terminal_count, can_publish in cases:
-            with self.subTest(expected=expected):
-                with tempfile.TemporaryDirectory() as temporary:
-                    run_dir, _ = self.make_recovery_run(
-                        Path(temporary),
-                        terminal_states=states,
-                    )
-                    stdout = io.StringIO()
-                    with contextlib.redirect_stdout(stdout):
-                        exit_code = run_monju.read_status(
-                            self.recovery_args(run_dir)
-                        )
-                    output = stdout.getvalue()
-
-                self.assertEqual(exit_code, 0)
-                self.assertIn("STATUS=stale_running", output)
-                self.assertIn(f"RECOVERY={expected}", output)
-                self.assertIn(
-                    f"RECOVERY_TERMINAL_RESULTS={terminal_count}",
-                    output,
-                )
-                self.assertIn(
-                    f"RECOVERY_CAN_PUBLISH={can_publish}",
-                    output,
-                )
-
-    def test_bad_agent_path_records_supervisor_failure(self) -> None:
+    def test_background_remains_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            home = root / "home"
             workspace = root / "workspace"
-            output = root / "reviews"
+            home.mkdir()
             workspace.mkdir()
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-
-            result = self.run_command(
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--agent-bin",
-                str(root / "missing-agent"),
-            )
-
-            self.assertEqual(result.returncode, 70, result.stderr)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "supervisor_failure")
-
-    def test_publication_failure_preserves_staging(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            run_dir = root / "monju-test-publication-failure"
-            workspace.mkdir()
-            run_dir.mkdir()
-            fake = self.make_fake_agent(root)
-            prompt = run_dir / f"{run_dir.name}-00-review-brief.md"
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            review_brief, effective_prompt = run_monju.read_review_brief(prompt)
-
-            with (
-                mock.patch.object(
-                    run_monju,
-                    "publish_staging",
-                    side_effect=PermissionError("simulated publication failure"),
-                ),
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
-            ):
-                exit_code = run_monju.execute_reviews(
-                    workspace=workspace,
-                    prompt_file=prompt,
-                    run_dir=run_dir,
-                    run_id=run_dir.name,
-                    agent_bin=str(fake),
-                    timeout_seconds=5,
-                    review_brief=review_brief,
-                    effective_prompt=effective_prompt,
-                    run_started_at=run_monju.iso_now(),
-                    notification_mode="none",
-                )
-
-            self.assertEqual(exit_code, 74)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "artifact_failure")
-            self.assertEqual(len(manifest["results"]), 3)
-            self.assertTrue(
-                all(item["status"] == "success" for item in manifest["results"])
-            )
-            staging = Path(manifest["staging_preserved"])
-            self.assertTrue(staging.is_dir())
-            self.assertEqual(len(list(staging.glob("*.md"))), 5)
-            shutil.rmtree(staging.parent)
-
-    def test_post_publication_cleanup_failure_keeps_success_status(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            run_dir = root / "monju-test-cleanup-failure"
-            workspace.mkdir()
-            run_dir.mkdir()
-            fake = self.make_fake_agent(root)
-            prompt = run_dir / f"{run_dir.name}-00-review-brief.md"
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            review_brief, effective_prompt = run_monju.read_review_brief(prompt)
-            stderr = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    run_monju.shutil,
-                    "rmtree",
-                    side_effect=RuntimeError("simulated cleanup failure"),
-                ),
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(stderr),
-            ):
-                exit_code = run_monju.execute_reviews(
-                    workspace=workspace,
-                    prompt_file=prompt,
-                    run_dir=run_dir,
-                    run_id=run_dir.name,
-                    agent_bin=str(fake),
-                    timeout_seconds=5,
-                    review_brief=review_brief,
-                    effective_prompt=effective_prompt,
-                    run_started_at=run_monju.iso_now(),
-                    notification_mode="none",
-                )
-
-            self.assertEqual(exit_code, 0)
-            manifest = json.loads(
-                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["status"], "success")
-            self.assertIn("could not remove staging", stderr.getvalue())
-            pointer = run_dir / f".{run_dir.name}-staging"
-            staging = Path(pointer.read_text(encoding="utf-8").strip())
-            shutil.rmtree(staging.parent)
-            pointer.unlink()
+            config = self.write_config(root / "reviewers.json", 1)
+            result = self.run_command(home, config, "--background")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Use --tmux", result.stderr)
 
     @unittest.skipIf(os.name != "posix", "POSIX signal behavior")
-    def test_interrupt_terminates_children_and_publishes_diagnostics(self) -> None:
+    def test_interrupt_stops_workers_and_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            home = root / "home"
             workspace = root / "workspace"
-            output = root / "reviews"
+            home.mkdir()
             workspace.mkdir()
-            fake = self.make_fake_agent(root)
-            run_dir, prompt = self.prepare(workspace, output)
-            prompt.write_text("# Review\nInspect the workspace.", encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "AGENT_CLI_CREDENTIAL_STORE": "file",
-                    "FAKE_AGENT_SLEEP": "20",
-                    "HOME": str(self.test_home),
-                }
-            )
-            self.trust_workspace(workspace, self.test_home)
+            config = self.write_config(root / "reviewers.json", 1)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            env = self.command_env(home, config, FAKE_OPENCODE_SLEEP="20")
             proc = subprocess.Popen(
                 [
                     sys.executable,
                     str(SCRIPT),
+                    "--reviewers-file",
+                    str(config),
                     "--workspace",
                     str(workspace),
                     "--run-dir",
                     str(run_dir),
                     "--prompt-file",
                     str(prompt),
-                    "--agent-bin",
+                    "--opencode-bin",
                     str(fake),
                 ],
                 cwd=REPOSITORY,
-                env=environment,
-                stdin=subprocess.DEVNULL,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            manifest_path = run_dir / f"{run_dir.name}-manifest.json"
-            deadline = time.monotonic() + 5
+            manifest = run_dir / f"{run_dir.name}-manifest.json"
+            deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
-                if manifest_path.is_file():
-                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if payload.get("status") == "running":
+                if manifest.is_file() and json.loads(manifest.read_text()).get("status") == "running":
+                    break
+                time.sleep(0.05)
+            else:
+                proc.kill()
+                self.fail("runner did not enter running state")
+            staging_pointer = run_dir / f".{run_dir.name}-staging"
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if staging_pointer.is_file():
+                    staging = Path(staging_pointer.read_text().strip())
+                    if list(staging.glob("*.worker-task.json")):
                         break
                 time.sleep(0.05)
             else:
                 proc.kill()
-                self.fail("runner never entered running state")
-
-            time.sleep(0.2)
+                self.fail("reviewer worker did not start")
             proc.send_signal(signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=8)
+            stdout, stderr = proc.communicate(timeout=12)
             self.assertEqual(proc.returncode, 130, stderr)
             self.assertIn("STATUS=interrupted", stdout)
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["status"], "interrupted")
-            self.assertEqual(len(payload["results"]), 3)
+            self.assertFalse(any(t.name.startswith("monju-heartbeat-") for t in threading.enumerate()))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGHUP"),
+        "POSIX SIGHUP behavior",
+    )
+    def test_sighup_stops_workers_for_tmux_session_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            env = self.command_env(home, config, FAKE_OPENCODE_SLEEP="20")
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--reviewers-file",
+                    str(config),
+                    "--workspace",
+                    str(workspace),
+                    "--run-dir",
+                    str(run_dir),
+                    "--prompt-file",
+                    str(prompt),
+                    "--opencode-bin",
+                    str(fake),
+                ],
+                cwd=REPOSITORY,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            manifest = run_dir / f"{run_dir.name}-manifest.json"
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if manifest.is_file() and json.loads(manifest.read_text()).get("status") == "running":
+                    break
+                time.sleep(0.05)
+            else:
+                proc.kill()
+                self.fail("runner did not enter running state")
+            staging_pointer = run_dir / f".{run_dir.name}-staging"
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if staging_pointer.is_file():
+                    staging = Path(staging_pointer.read_text().strip())
+                    if list(staging.glob("*.worker-task.json")):
+                        break
+                time.sleep(0.05)
+            else:
+                proc.kill()
+                self.fail("reviewer worker did not start")
+            proc.send_signal(signal.SIGHUP)
+            stdout, stderr = proc.communicate(timeout=12)
+            self.assertEqual(proc.returncode, 128 + signal.SIGHUP, stderr)
+            self.assertIn("STATUS=interrupted", stdout)
+            payload = json.loads(manifest.read_text())
+            self.assertEqual(payload["interrupted_signal"], signal.SIGHUP)
+
 
 if __name__ == "__main__":
     unittest.main()

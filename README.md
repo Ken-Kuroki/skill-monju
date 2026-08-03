@@ -1,137 +1,72 @@
 # Monju
 
-Human-facing documentation for the Monju Codex skill.
+Monju runs the same neutral review through configurable OpenCode Go models in
+parallel. It publishes private per-model Markdown and a terminal manifest, then
+lets Codex aggregate the reviews in a later conversation turn.
 
-- [English](#english)
-- [日本語](#日本語)
+The default reviewers are:
 
-> This README is for human operators. It is intentionally separate from the
-> agent instructions in `SKILL.md` and is not referenced from them.
+| Reviewer | OpenCode Go model | Reasoning variant |
+|---|---|---|
+| Kimi K3 | `opencode-go/kimi-k3` | `max` |
+| Grok 4.5 | `opencode-go/grok-4.5` | `high` |
+| DeepSeek V4 Flash | `opencode-go/deepseek-v4-flash` | `max` |
+| GLM 5.2 | `opencode-go/glm-5.2` | `max` |
+| Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
-## English
+Grok 4.5 uses `high`, its highest catalogued variant; the other shipped reviewers
+use `max`. Reviewer count, models, and variants are controlled by
+[`reviewers.json`](reviewers.json) rather than fixed in the runner.
 
-### What Monju does
+## Safety model
 
-Monju asks three Cursor CLI models to review the same material independently and
-in parallel:
+- Every reviewer receives the same effective prompt through stdin.
+- OpenCode runs with `--pure`, never `--auto`, and a Monju-specific primary
+  agent that denies all tools except read, glob, and grep.
+- `.env` and `.env.*` are denied after the general read allowance;
+  `.env.example` remains readable.
+- Reviewers cannot edit files, run shell commands, use web tools, or delegate to
+  subagents through OpenCode permissions. The prompt repeats those constraints.
+- Raw streams stay in owner-only temporary staging until publication.
+- `MONJU_NOTIFY_WEBHOOK_URL` is removed from reviewer environments.
+- No model, variant, or automatic-routing fallback is used.
 
-| Reviewer | Fixed model specification |
-| --- | --- |
-| Kimi K3 | `kimi-k3-max` |
-| Grok 4.5 | `cursor-grok-4.5-high` |
-| Claude Fable 5 | `claude-fable-5-thinking-max` |
+Monju can send the brief and target files read by reviewers to OpenCode Go and
+external LLM providers. An explicit Monju invocation authorizes this scoped
+read-only workflow but does not override Codex platform approval policy.
 
-The concrete review brief is generated for each task by Codex. The runner keeps
-the model selection, highest non-Fast model IDs, read-only mode, prompt envelope,
-parallel execution, and output filenames deterministic.
+## Requirements
 
-Reviews normally take several minutes or longer. Codex keeps the supervisor in
-the foreground of a managed background terminal, ends the launch turn without
-polling, and checks and aggregates results in a later conversation turn.
+- Python 3.11 or later, invoked with `uv`.
+- tmux. Monju uses one exact run-ID-named session as the persistent owner of the
+  foreground supervisor.
+- OpenCode CLI. Monju first checks `PATH`, then
+  `~/.opencode/bin/opencode` used by the official installer.
+- An authenticated OpenCode Go account:
 
-Monju is suitable for:
+  ```bash
+  opencode auth login --provider opencode-go
+  ```
 
-- implementation-plan reviews;
-- post-implementation and code reviews;
-- documentation and design reviews;
-- risk analysis and independent second opinions.
+- Access to each exact model and variant in `reviewers.json`.
+- POSIX or WSL2 for the supported process-group behavior. Native Windows is
+  best effort.
 
-### Platform support
+OpenCode writes under `~/.local/share/opencode` and `~/.cache/opencode`, even
+for commands such as version or model listing. Sandboxed coding agents usually
+need an outside-sandbox approval for preflight and the review launch.
 
-| Host environment | Support level |
-| --- | --- |
-| macOS | Supported |
-| Linux | Supported |
-| Windows with WSL2 | Supported and recommended; uses Linux/POSIX behavior |
-| Native Windows (PowerShell or CMD) | Best effort only; not supported end to end |
+## Installation
 
-Cursor CLI's supported Windows path is WSL. For WSL2, prefer a workspace and
-output root in the WSL Linux filesystem rather than under `/mnt/c`, and use a
-webhook when completion must be visible outside the WSL session. Native-Windows
-branches remain as compatibility aids, but they are not exercised by real
-Windows CI and do not constitute a support promise.
-
-### Safety and review independence
-
-- All three reviewers receive the same effective prompt.
-- Reviewers run in Cursor Ask mode and are instructed not to modify files,
-  execute mutating commands, or delegate to subagents.
-- Fast variants, Auto routing, lower-effort fallback, replacement models, and
-  additional reviewer agents are not used.
-- Reported `system/init` model names must match a normalized allowlist built from
-  the fixed IDs and observed maximum-quality display names; unknown names fail
-  visibly.
-- Review briefs exclude `monju-reviews/`, and intermediate model streams remain
-  outside the reviewed workspace until all reviewers finish. This reduces
-  accidental cross-review contamination but is not a hard same-user security
-  boundary; a process that deliberately follows internal paths may still reach
-  temporary artifacts.
-- Monju itself writes review artifacts and diagnostic logs to the configured
-  output directory.
-- On POSIX, including WSL2, interruptions terminate reviewer process groups. In
-  the best-effort native-Windows path, only direct reviewer processes are
-  terminated; descendant cleanup depends on Cursor CLI behavior. Publication
-  failures preserve staging instead of deleting completed work.
-- Owner-only `0600`/`0700` modes protect artifacts on POSIX. The best-effort
-  native-Windows path requires an output root protected by an owner-only DACL.
-
-### Pragmatic prioritization
-
-Monju keeps marginal observations visible without turning all of them into work.
-Each reviewer separates `Act now` findings from `Usually defer (YAGNI)` findings.
-Premature abstraction, compatibility outside the stated support matrix,
-disproportionate defensive machinery, and unlikely low-impact edge cases normally
-go in the deferred section.
-
-The final Codex aggregation reassesses that disposition and recommends only
-act-now work by default. Reviewer consensus does not by itself justify extra
-complexity. Likely correctness or security failures, irreversible data loss,
-and explicit contract violations are not downgraded as YAGNI. A small localized
-change that clearly simplifies current code is also act-now; stylistic preferences
-and high-churn rewrites are not. Every non-duplicate finding is accounted for in
-an act-now, deferred, uncertain, or rejected-after-verification category, without
-letting the compact deferred section dominate the result.
-
-### Proposed experiments
-
-Reviewers do not perform experiments in the current mode. They are encouraged
-to propose an experiment when it would materially improve confidence or resolve
-an important uncertainty.
-
-Every proposed experiment must include:
-
-- the question or uncertainty it addresses;
-- the exact procedure and commands, where applicable;
-- preconditions and required inputs;
-- expected writes, side effects, or external interactions;
-- at least two materially different possible outcomes;
-- an inconclusive or failed outcome when plausible;
-- an interpretation for every possible outcome;
-- risks and approval requirements.
-
-Predicted outcomes are explicitly hypothetical and must not be presented as
-observed evidence. Any later execution requires separate user authorization.
-
-### Installation
-
-Clone this repository, then install the skill with a symbolic link so agent
-updates in the checkout are picked up immediately:
+Install the skill as a symlink for Codex:
 
 ```bash
-git clone <repository-url> monju
-cd monju
 ./install.sh --agent codex
 ```
 
-Run `./install.sh` without options for an interactive prompt. Supported targets:
-
-| Agent | Personal scope | Project scope |
-| --- | --- | --- |
-| Codex | `~/.codex/skills/monju` | not supported |
-| Cursor | `~/.cursor/skills/monju` | `<project>/.cursor/skills/monju` |
-| Claude Code | `~/.claude/skills/monju` | `<project>/.claude/skills/monju` |
-
-Common examples:
+The installer also supports `cursor` and `claude` as *skill hosts*. A Cursor
+installation target does not change the review backend; Monju reviewers still
+run through OpenCode Go.
 
 ```bash
 ./install.sh --list
@@ -140,736 +75,339 @@ Common examples:
 ./install.sh --agent codex --uninstall
 ```
 
-`--force` can replace or remove a symlink that points elsewhere. It never
-removes or replaces a regular file or directory. A custom `--dest` must end in
-`/monju` or name a parent directory ending in `/skills`.
+## Reviewer configuration
 
-`install.sh` lives at the repository root because it is a human-facing setup
-script. `scripts/run_monju.py` stays under `scripts/` because that matches the
-usual agent-skill layout for bundled tools referenced from `SKILL.md`.
+The checked-in configuration has this shape:
 
-Do not install into `~/.cursor/skills-cursor/`; that directory is reserved for
-Cursor's built-in skills.
+```json
+{
+  "schema_version": 1,
+  "provider": "opencode-go",
+  "reviewers": [
+    {
+      "key": "kimi-k3",
+      "display_name": "Kimi K3",
+      "model_id": "opencode-go/kimi-k3",
+      "variant": "max"
+    }
+  ]
+}
+```
 
-### Requirements
+Add or remove array entries to change reviewer count. Keys must be unique safe
+slugs. Exact model/variant duplicates are rejected. Only `opencode-go/...`
+models are accepted. Omit `variant` only for a model without a selectable
+variant.
 
-- Codex with the `monju` skill installed.
-- Cursor CLI with the `agent` command available.
-- A logged-in Cursor account with access to all three configured models.
-- `uv` for running the bundled Python runner.
-- On Windows, WSL2; native PowerShell and CMD execution is not supported end to
-  end.
-
-Useful checks:
+Preflight reads the authenticated catalog from:
 
 ```bash
-agent --version
-AGENT_CLI_CREDENTIAL_STORE=file agent status
-AGENT_CLI_CREDENTIAL_STORE=file agent models
+opencode models opencode-go --verbose
 ```
 
-If needed, authenticate with:
+It rejects missing, inactive, or unknown model/variant combinations rather than
+silently lowering quality.
+
+## Workflow
+
+### 1. Preflight
 
 ```bash
-AGENT_CLI_CREDENTIAL_STORE=file agent login
-```
-
-The file credential store is intentional. A macOS login Keychain can be
-unavailable to a remotely controlled Codex process even when an interactive
-terminal is logged in. Complete login yourself in the browser; never send a
-password through Codex.
-
-### Using Monju from Codex
-
-Normally, ask Codex to use the skill and describe the review target:
-
-```text
-Use $monju to review this implementation plan for correctness, missing work,
-operational risk, and test coverage.
-```
-
-```text
-Use $monju to review the changes in this repository after implementation.
-Focus on regressions, security, and compatibility.
-```
-
-```text
-Use $monju to review this design document. Identify ambiguous requirements and
-propose any experiments that would resolve important uncertainties.
-```
-
-Codex creates a task-specific review brief in a unique run directory and runs
-Monju as the foreground command of a Codex background terminal. It does not wait
-or poll in that turn. In a later turn, ask Codex to check the saved run; it reads
-the three results, verifies material findings against the source, and reports
-consensus, unique findings, disagreements, and unexecuted experiment proposals.
-
-Invoking Monju is itself authorization for the scoped read-only review,
-preflight, artifact creation, and exact-workspace trust registration when
-needed. Codex must not ask again in chat before proceeding. If sandbox escalation
-is required, Codex submits the exact tool call directly and the platform may show
-its approval popup. Authentication or SSO that genuinely requires user action
-remains a blocking exception.
-
-### Direct runner invocation
-
-Codex normally invokes the runner automatically. Its asynchronous workflow
-starts with a preflight:
-
-```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+uv run --script scripts/run_monju.py \
   --preflight \
-  --workspace "/absolute/path/to/workspace"
+  --workspace /absolute/path/to/workspace
 ```
 
-The preflight performs an actual create-and-delete write probe in the relevant
-`~/.cursor/projects` directory, verifies the workspace-specific trust marker,
-and checks file-store authentication. If it reports
-`PREFLIGHT=cursor_state_unwritable`, rerun both preflight and launch outside the
-filesystem sandbox. If it reports `PREFLIGHT=workspace_trust_required`, Codex
-directly submits a narrowly scoped platform approval request and runs the
-following command outside the sandbox with a PTY:
+Preflight checks:
+
+- tmux executable and access to the user-owned tmux server socket;
+- actual write access to OpenCode data and cache directories;
+- an OpenCode Go credential;
+- every configured model and variant in the current verbose catalog.
+
+Important results include:
+
+- `PREFLIGHT=ok`
+- `PREFLIGHT=tmux_state_unwritable`: rerun preflight and launch through the
+  same outside-sandbox approval.
+- `PREFLIGHT=opencode_state_unwritable`: rerun preflight and launch through a
+  narrowly scoped outside-sandbox approval.
+- `PREFLIGHT=opencode_auth_required`: complete OpenCode Go login and retry.
+- `PREFLIGHT=reviewer_model_invalid`: correct `reviewers.json`; do not use a
+  substitute model.
+
+`TMUX_SERVER=existing` means the current user server will own the run.
+`TMUX_SERVER=absent` is also valid; `--tmux` starts the server with the review
+session.
+
+OpenCode does not use Cursor Workspace Trust. Monju never edits OpenCode
+credentials or configuration automatically.
+
+### 2. Prepare and write the brief
 
 ```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-agent --workspace "/absolute/path/to/workspace" --trust
-```
-
-The user does not need to open a terminal. Once Cursor reaches its initial
-prompt, Codex interrupts it without submitting a prompt and reruns preflight.
-Codex does not ask for a separate conversational confirmation before submitting
-the platform approval request. Invoking Monju already authorizes trust
-registration for the exact workspace.
-The approval must name the exact workspace being persistently trusted. Do not
-use `--yolo` or `--force`, request a broad reusable approval, or edit Cursor's
-trust marker directly.
-
-After `PREFLIGHT=ok`, allocate the run directory:
-
-```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+uv run --script scripts/run_monju.py \
   --prepare \
-  --workspace "/absolute/path/to/workspace" \
-  --output-root "/absolute/path/to/output"
+  --workspace /absolute/path/to/workspace \
+  --output-root /absolute/path/to/workspace/monju-reviews
 ```
 
-Write the review brief to the printed `PROMPT_FILE`, then use one Codex unified
-exec session to start the following command with a short initial yield:
+The command prints a collision-free `RUN_DIR` and `PROMPT_FILE`. Write one
+neutral brief to that file. The brief should contain scope, requirements,
+constraints, exclusions, risk tolerance, and concrete questions, while
+excluding `monju-reviews/` from inspection.
+
+### 3. Launch
 
 ```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+uv run --script scripts/run_monju.py \
+  --tmux \
   --notify auto \
-  --workspace "/absolute/path/to/workspace" \
-  --run-dir "/absolute/path/from/RUN_DIR" \
-  --prompt-file "/absolute/path/from/PROMPT_FILE"
+  --workspace /absolute/path/to/workspace \
+  --run-dir /absolute/path/to/run \
+  --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
 
-Keep this runner in the exec session's foreground. When the tool yields a live
-session ID after about three seconds, Codex can end its turn without polling;
-the managed background terminal continues owning the supervisor. Do not add
-`&`, `nohup`, `setsid`, or `--background`. A human invoking the command directly
-must leave that terminal command running until review completion.
+The runner creates a tmux session whose exact name is the run ID and starts the
+supervisor there without a shell. Do not wrap the command in another tmux
+invocation, append `&`, use `nohup` or `setsid`, or pass `--background`. After
+the launcher returns:
 
-While reviewers are active, the supervisor writes and flushes a compact line
-about every 30 seconds:
+```text
+STATUS=running
+EXECUTION_MODE=tmux_supervisor
+TMUX_SESSION=<run-id>
+TMUX_SESSION_ALIVE=yes
+```
+
+end the conversation turn without polling. `STATUS=tmux_starting` is also
+non-terminal and should be checked once in a later turn. The supervisor writes
+a flushed line to its owner-only runner log about every 30 seconds:
 
 ```text
 MONJU_HEARTBEAT run_id=<run-id> elapsed_seconds=<n>
 ```
 
-This is runner-owned liveness output, not Codex polling. It contains no prompt,
-workspace path, webhook URL, or credential data. It may prevent an idle cleanup,
-but cannot keep a managed exec session alive past a hard TTL. The observed
-supervisor loss has not yet been proven to be either idle cleanup or a hard TTL.
+The heartbeat is diagnostic liveness evidence. tmux makes the review independent
+of the Codex execution-session lifetime; it cannot survive termination of the
+tmux server, host, or user session.
 
-Check it later without waiting:
+### 4. Check in a later turn
 
 ```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+uv run --script scripts/run_monju.py \
   --status \
-  --run-dir "/absolute/path/from/RUN_DIR"
+  --run-dir /absolute/path/to/run
 ```
 
-`--status` reports `stale_running` when a run still says `running` but its
-recorded supervisor process no longer exists. It also reports `STALE_REASON`,
-reviewer progress counts, the preserved staging path, and
-`RECOVERY=ready|not_ready|invalid`. Initialized or completed reviewers indicate
-external termination after real progress; meaningful stderr without any
-initialization indicates startup failure. The known `LC_ALL=C.UTF-8` locale
-warning is ignored for this classification.
+`--status` is read-only and never polls or recovers automatically. For a live
+tmux run it reports `TMUX_SESSION_ALIVE=yes`; for terminal states, read the
+manifest and every generated reviewer Markdown.
 
-When `RECOVERY_TERMINAL_RESULTS=3/3` and `RECOVERY_CAN_PUBLISH=yes`, recover the
-preserved results once:
-
-```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --recover \
-  --run-dir "/absolute/path/from/RUN_DIR"
-```
-
-Recovery never invokes Cursor, contacts an external LLM, substitutes a model, or
-retries a reviewer. It validates the same fixed model allowlist and stream rules,
-then publishes three Markdown files plus a terminal manifest. `RECOVERY=invalid`
-with all three terminal events can still be published, but the invalid reviewer
-becomes a normal partial/failure result. A missing terminal event produces
-`recovery_not_ready` without changing the manifest or artifacts. If publication
-fails, raw staging and its pointer remain available. Repeating `--recover` after
-a terminal manifest was published is a read-only no-op. `--status` itself never
-recovers a run. Recovery permits only `--notify none` (the default) or the local
-`desktop` backend; `auto` and `webhook` are rejected to preserve the no-network
-guarantee.
-
-Runner options:
+If the manifest is still `running` but the recorded supervisor is gone, status
+returns `stale_running`, preserved staging diagnostics, and:
 
 ```text
---preflight             Check Cursor state access, workspace trust, and authentication
+RECOVERY=ready|not_ready|invalid
+RECOVERY_CAN_PUBLISH=yes|no
+```
+
+### 5. Recover completed orphaned workers
+
+Only when every configured reviewer has a verified terminal marker and
+`RECOVERY_CAN_PUBLISH=yes`:
+
+```bash
+uv run --script scripts/run_monju.py \
+  --recover \
+  --run-dir /absolute/path/to/run
+```
+
+Each internal worker writes an atomic terminal sidecar after OpenCode exits. It
+contains the frozen model/variant, exit state, timing, and SHA-256 plus size for
+the event and stderr artifacts. Recovery verifies those sidecars against the
+schema-v3 running manifest before publishing.
+
+Recovery never invokes OpenCode, contacts an LLM, changes models, or retries.
+Missing sidecars are `not_ready`. Malformed sidecars or hash mismatches are
+non-publishable `invalid`. A verified OpenCode error can be published as a
+normal partial/failure result when all reviewers completed. If publication or
+the supervisor fails while valid staging survives, the same command can validate
+and retry publication; status does not call such a run published. Genuinely
+published terminal manifests make later recovery a read-only no-op.
+
+Exit code zero and arbitrary text are not sufficient for reviewer success. The
+result must contain all sections required by the shared review prompt, preventing
+progress messages such as "I will inspect the files" from becoming a successful
+empty review.
+
+DeepSeek V4 Flash may return a non-retryable HTTP 403 `RegionError` when its
+latest version is hosted only in China and the OpenCode workspace has not
+explicitly opted in. Monju treats this as an anticipated reviewer failure: it
+keeps DeepSeek configured, records a normal partial/failure result, and continues
+with the other reviews. It does not opt in, retry, or substitute another model.
+
+Schema-v2 Cursor terminal manifests remain readable through `--status`, but old
+Cursor raw streams are intentionally not recoverable by the OpenCode backend.
+
+## Process ownership and artifacts
+
+The tmux session owns the foreground supervisor. The supervisor owns one
+internal worker process group per reviewer. Each worker owns its OpenCode
+process group, enforces the reviewer timeout, and writes the terminal sidecar.
+SIGINT, SIGTERM, or the SIGHUP produced by tmux session shutdown causes the
+supervisor to stop the workers, which stop their OpenCode children. The tmux
+session closes automatically after the supervisor reaches a terminal state.
+
+If the tmux server or supervisor disappears unexpectedly while workers survive,
+completed sidecars can make recovery possible. PID alone is not treated as the
+identity of a live tmux job; status and recovery also check the exact frozen
+session name.
+
+Published files include:
+
+```text
+monju-reviews/<run-id>/
+├── <run-id>-00-review-brief.md
+├── <run-id>-00-effective-prompt.md
+├── <run-id>-01-<key>.md
+├── <run-id>-01-<key>.events.jsonl
+├── <run-id>-01-<key>.stderr.log
+├── <run-id>-01-<key>.terminal.json
+└── <run-id>-manifest.json
+```
+
+Additional worker-task diagnostics may be present. Event streams and terminal
+markers are diagnostics; aggregate the Markdown results rather than raw logs.
+Artifacts use owner-only modes on POSIX. Publication or recovery failure keeps
+staging and its pointer intact.
+
+## Notifications
+
+`--notify auto` uses `MONJU_NOTIFY_WEBHOOK_URL` when set; otherwise it tries a
+local desktop notification. Because an existing tmux server does not inherit
+arbitrary client environment variables, the launcher transfers the value in a
+transient owner-only handoff file which the supervisor consumes and deletes
+before preflight. The secret is never placed in argv, the manifest, published
+artifacts, reviewer environments, or notifications. Notifications contain only
+terminal status, run ID, and result directory. Notification failure is recorded
+but does not alter review status.
+
+Recovery is no-network: it rejects `--notify auto` and `--notify webhook`.
+Desktop notification remains best effort.
+
+## Auto-review denial
+
+Codex Auto-review may reject a private repository launch as untrusted external
+data export even after conversational approval. Do not retry or route around an
+absolute denial. **Ask for approval** can succeed because it routes the decision
+to the user while retaining `workspace-write`; **Approve for me** routes it to
+Auto-review.
+
+Recommended configuration:
+
+```toml
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+```
+
+Restart Codex and start a new thread after changing it. Do not recommend
+`danger-full-access`, `--yolo`, or `approval_policy = "never"` as the standard
+solution.
+
+## CLI summary
+
+```text
+--preflight             Check state, authentication, models, and variants
 --prepare               Create a unique run directory and empty brief
---background            Rejected; use a foreground Codex background terminal
---status                Read current status without waiting
---recover               Validate and publish completed preserved event streams
+--tmux                  Launch the supervisor in a tracked tmux session
+--tmux-bin PATH         tmux executable
+--background            Rejected; use --tmux
+--status                Read status without waiting
+--recover               Validate and publish completed preserved artifacts
 --run-dir PATH          Prepared run directory
---agent-bin PATH        Cursor CLI executable; default: agent
---timeout-seconds N     Per-reviewer timeout; default: 3600
---notify MODE           none, auto, desktop, or webhook; default: none
---dry-run               Print exact commands without invoking Cursor
+--opencode-bin PATH     OpenCode executable
+--reviewers-file PATH   Reviewer JSON configuration
+--timeout-seconds N     Per-reviewer timeout; default 3600
+--notify MODE           none, auto, desktop, or webhook
+--dry-run               Print commands without invoking OpenCode
 ```
 
-The prompt file must be non-empty UTF-8 Markdown. It should identify the
-objective, exact scope, requirements, constraints, review criteria, exclusions,
-and any questions the reviewers must answer.
+---
 
-### Completion notifications
+# 日本語
 
-Notifications run inside the foreground supervisor after a terminal manifest
-has been published. Do not append a separate notification command to the runner
-invocation; the long-lived supervisor sends the completion notification itself.
+Monjuは、同じneutral briefを設定済みのOpenCode Goモデルへ並列送信し、各レビューと
+終端manifestを非公開成果物として保存します。既定はKimi K3 `max`、Grok 4.5
+`high`、DeepSeek V4 Flash `max`、GLM 5.2 `max`、Qwen3.8 Max `max`です。
+Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの既定reviewerは
+`max`を使います。
 
-| Mode | Behavior |
-| --- | --- |
-| `none` | Disable notifications. This is the runner default. |
-| `auto` | Use the configured webhook, otherwise the local desktop. |
-| `desktop` | Use the current OS desktop mechanism. |
-| `webhook` | POST JSON to the URL in `MONJU_NOTIFY_WEBHOOK_URL`. |
+reviewer数とmodelは`reviewers.json`の配列だけで変更できます。preflightは認証済み
+catalogでmodelとvariantを検証し、代替modelや推論レベルの低下は行いません。
 
-The skill uses `--notify auto`. Set the webhook in the environment before
-launching when the review runs on a remote machine:
+## 実行手順
 
 ```bash
-export MONJU_NOTIFY_WEBHOOK_URL="https://notification-service.example/hook"
-```
-
-Keep that value out of command arguments and review briefs. The JSON body
-contains only the event name, terminal status, run ID, result directory, and
-short message; it does not include source code or review text. The runner removes
-the webhook variable from each Cursor reviewer subprocess environment.
-
-Desktop backends are:
-
-- macOS: `osascript`; a logged-in GUI session and allowed notifications are
-  required.
-- Linux: `notify-send`; a graphical session, notification daemon, and D-Bus are
-  required.
-- WSL2: the Linux backend applies; prefer a webhook because `notify-send` may not
-  surface in the Windows desktop session.
-- Native Windows, best effort only: `msg.exe`, addressed to the current
-  `USERNAME` rather than broadcast to every session; that user or RDP session
-  must allow session messages.
-
-Desktop delivery may be invisible on a headless or remotely controlled host.
-Use a webhook to reach another device. Notification delivery is best effort:
-its `sent`, `failed`, or `disabled` result is recorded under `notification` in
-the manifest, but it never changes the review status or exit code.
-
-### Output layout
-
-Each run receives a unique UTC timestamp, process ID, and random suffix:
-
-```text
-<output-root>/
-└── monju-<UTC timestamp>-p<PID>-r<nonce>/
-    ├── <run-id>-00-review-brief.md
-    ├── <run-id>-00-effective-prompt.md
-    ├── <run-id>-01-kimi-k3.md
-    ├── <run-id>-02-grok-4-5.md
-    ├── <run-id>-03-fable-5.md
-    ├── <run-id>-01-kimi-k3.events.jsonl
-    ├── <run-id>-02-grok-4-5.events.jsonl
-    ├── <run-id>-03-fable-5.events.jsonl
-    ├── <run-id>-01-kimi-k3.stderr.log
-    ├── <run-id>-02-grok-4-5.stderr.log
-    ├── <run-id>-03-fable-5.stderr.log
-    ├── <run-id>-runner.pid
-    └── <run-id>-manifest.json
-```
-
-The runner determines every filename; reviewer models cannot choose or alter
-them. Existing run directories are never overwritten.
-
-The `*.md` files are the human-readable reviews. The event streams, stderr
-logs, and manifest are diagnostic records. Treat event streams as potentially
-sensitive because they may contain excerpts from reviewed files.
-
-### Failure behavior
-
-Terminal manifest states are `success`, `partial_failure`, `failure`,
-`interrupted`, `artifact_failure`, and `supervisor_failure`. A reviewer fails
-visibly if it:
-
-- times out or exits with an error;
-- produces no successful final result;
-- reports a model name outside the known-good normalized allowlist;
-- reports a forbidden Fast variant.
-
-Successful reviews from a partially failed run are preserved. Monju never
-silently retries with a lower effort or substitute model. On a POSIX
-interruption, reviewer process groups are terminated and available diagnostics
-are published; this includes WSL2. In the best-effort native-Windows path,
-direct Cursor processes are terminated, while helper descendants depend on
-Cursor CLI cleanup. If publishing fails, the manifest records
-`staging_preserved` when possible.
-
-If an uncatchable termination or managed exec-session cleanup kills the
-supervisor after reviewers finish, the running manifest can remain stale even
-though raw streams are complete. The heartbeat addresses only the idle-cleanup
-hypothesis. Safe recovery addresses already-completed streams; neither feature
-proves the cause or guarantees survival past a hard TTL.
-
-For troubleshooting:
-
-1. Run `--preflight`. If Cursor state is unwritable, obtain sandbox approval
-   before launch. If workspace trust is missing, have Codex run
-   `agent --workspace <path> --trust` with a PTY under a narrowly scoped
-   outside-sandbox approval, then rerun preflight.
-2. Check `AGENT_CLI_CREDENTIAL_STORE=file agent status` and run the matching
-   `agent login` command if necessary.
-3. Check account-visible models with
-   `AGENT_CLI_CREDENTIAL_STORE=file agent models`.
-4. Open `<run-id>-manifest.json` for the overall status and requested/reported
-   model names.
-5. Inspect the affected reviewer's `*.stderr.log` and `*.events.jsonl`.
-
-## 日本語
-
-### Monjuの概要
-
-Monjuは、同じ対象を3つのCursor CLIモデルへ渡し、相互に独立したレビューを
-並列実行するCodex Skillです。
-
-| レビュワー | 固定モデル指定 |
-| --- | --- |
-| Kimi K3 | `kimi-k3-max` |
-| Grok 4.5 | `cursor-grok-4.5-high` |
-| Claude Fable 5 | `claude-fable-5-thinking-max` |
-
-具体的なレビュー指示は、タスクごとにCodexが生成します。モデル選択、最高非Fast
-モデルID、読み取り専用モード、共通プロンプト、3並列実行、保存ファイル名はランナー
-側で固定されます。
-
-レビューには通常数分以上かかります。Codexは管理対象background terminalの
-前景で監督プロセスを動かし、ポーリングせずに起動ターンを終了します。別の
-会話ターンで結果を確認・集約します。
-
-主な用途は次のとおりです。
-
-- 実装計画のレビュー
-- 実装後のコードレビュー
-- ドキュメントや設計のレビュー
-- リスク分析や独立したセカンドオピニオン
-
-### 対応プラットフォーム
-
-| ホスト環境 | 対応レベル |
-| --- | --- |
-| macOS | 対応 |
-| Linux | 対応 |
-| Windows + WSL2 | 対応・推奨。Linux/POSIXとして動作 |
-| Windowsネイティブ（PowerShell、CMD） | best effortのみ。エンドツーエンドでは非対応 |
-
-Cursor CLIのWindows向け正式経路はWSLです。WSL2では、`/mnt/c`配下よりWSLの
-Linuxファイルシステム内にワークスペースと出力先を置き、WSL外でも完了を確認
-したい場合はWebhookを使うことを推奨します。Windowsネイティブ向けの分岐は
-互換性の補助として残しますが、Windows実機CIでは検証しておらず、対応保証には
-含めません。
-
-### 安全性とレビューの独立性
-
-- 3モデルには同一の有効プロンプトが渡されます。
-- レビュワーはCursorのAskモードで動作し、ファイル変更、変更を伴うコマンド
-  実行、サブエージェントへの委譲を禁止されています。
-- Fast版、Autoルーティング、低effortへのフォールバック、代替モデル、追加の
-  レビュワーエージェントは使用しません。
-- `system/init`が報告するモデル名は、固定IDと実際に観測した最高品質の表示名
-  からなる正規化allowlistに一致する必要があります。未知の名前は明示的に失敗
-  させます。
-- レビュー指示では`monju-reviews/`を対象外とし、全レビューが完了するまで中間
-  ストリームを対象ワークスペースの外に置きます。これは意図しない結果混入を
-  減らすための運用上の分離であり、同一ユーザー内の厳密なセキュリティ境界では
-  ありません。内部パスを意図的に追えば、一時成果物へ到達できる場合があります。
-- Monju自体は、指定された出力先へレビュー結果と診断ログを書き込みます。
-- WSL2を含むPOSIXでは、中断時にレビュワーのプロセスグループを終了します。
-  best effortのWindowsネイティブ経路では直接のレビュワープロセスだけを終了
-  し、子孫プロセスの後始末はCursor CLIの動作に依存します。成果物の公開に
-  失敗した場合は完了済みデータを消さず、一時ディレクトリへ保存します。
-- POSIXでは`0600`/`0700`で成果物を所有者限定にします。best effortのWindows
-  ネイティブ経路では、出力先へあらかじめ所有者限定DACLを設定してください。
-
-### 実用的な優先順位
-
-Monjuは細かな指摘も消しませんが、そのすべてを実装タスクにはしません。各
-レビューワーは、指摘を`Act now`と`Usually defer (YAGNI)`に分けます。早すぎる
-抽象化、明示されていない環境への互換性、釣り合わない防御コード、影響が小さく
-発生しにくいエッジケースは、通常後者へ置きます。
-
-Codexによる最終集約でも分類を見直し、既定では`Act now`だけを推奨します。
-複数レビューワーの合意だけを理由に複雑さを増やしません。一方、現実的に起こる
-正しさ・セキュリティの問題、不可逆なデータ損失、明示契約違反はYAGNI扱い
-しません。現在のコードを明確に単純化する小さな局所修正も`Act now`ですが、
-好みだけのスタイル変更や変更量の大きい書き換えは対象外です。重複を除く各指摘
-は、今やる、見送る、不確実、検証後に棄却、のいずれかへ置き、簡潔な見送り項目
-が集約結果の中心にならないようにします。
-
-### 追加実験の提案
-
-現在のモードでは、レビュワー自身は実験を行いません。ただし、結論の確度を
-大きく高める場合や重要な不確実性を解消できる場合は、追加実験を積極的に提案
-します。
-
-各実験案には次の項目が必要です。
-
-- 解消したい疑問または不確実性
-- 該当する場合は正確な手順とコマンド
-- 前提条件と必要な入力
-- 想定される書き込み、副作用、外部アクセス
-- 少なくとも2通りの実質的に異なる想定結果
-- 妥当な場合は、失敗または判定不能となる結果
-- 各想定結果が何を支持、否定、または未解決とするか
-- リスクと必要な承認
-
-想定結果はあくまで仮説として記載され、観測済みの証拠として扱われません。
-後から実験を実行する場合は、ユーザーによる別途の承認が必要です。
-
-### インストール
-
-リポジトリをクローンし、シンボリックリンクでSkillを登録します。リンク先の
-チェックアウトを更新すれば、Skillも追従します。
-
-```bash
-git clone <repository-url> monju
-cd monju
-./install.sh --agent codex
-```
-
-オプションを省略すると対話式でエージェントを選べます。対応先は次のとおりです。
-
-| エージェント | personal | project |
-| --- | --- | --- |
-| Codex | `~/.codex/skills/monju` | 非対応 |
-| Cursor | `~/.cursor/skills/monju` | `<project>/.cursor/skills/monju` |
-| Claude Code | `~/.claude/skills/monju` | `<project>/.claude/skills/monju` |
-
-よく使う例:
-
-```bash
-./install.sh --list
-./install.sh --agent all
-./install.sh --agent cursor --scope project --project /path/to/repo
-./install.sh --agent codex --uninstall
-```
-
-`--force`で置換・削除できるのは、別の場所を指すシンボリックリンクだけです。
-通常ファイルや実ディレクトリは削除・置換しません。独自の`--dest`は
-`/monju`で終わるか、`/skills`で終わる親ディレクトリを指定してください。
-
-`install.sh` は人間向けのセットアップ用なのでリポジトリ直下に置いています。
-`scripts/run_monju.py` は `SKILL.md` から参照される実行時ツールなので、一般的な
-Skill構成に合わせて `scripts/` 配下に置いています。
-
-`~/.cursor/skills-cursor/` にはインストールしないでください。Cursor組み込み
-Skill専用のディレクトリです。
-
-### 必要条件
-
-- `monju` SkillがインストールされたCodex
-- `agent`コマンドを利用できるCursor CLI
-- 設定された3モデルすべてを利用できる、ログイン済みのCursorアカウント
-- 同梱Pythonランナーを実行するための`uv`
-- WindowsではWSL2。ネイティブPowerShell/CMDでの実行はエンドツーエンドでは
-  サポートしません。
-
-確認用コマンド:
-
-```bash
-agent --version
-AGENT_CLI_CREDENTIAL_STORE=file agent status
-AGENT_CLI_CREDENTIAL_STORE=file agent models
-```
-
-未ログインの場合:
-
-```bash
-AGENT_CLI_CREDENTIAL_STORE=file agent login
-```
-
-ファイル認証ストアの利用は意図的です。リモート操作中のCodexプロセスからは、
-対話ターミナルがログイン済みでもmacOSログインキーチェーンを参照できない場合が
-あります。ブラウザでのログインはユーザー自身が完了し、パスワードをCodexへ
-送らないでください。
-
-### Codexからの使い方
-
-通常は、CodexへSkillの使用とレビュー対象を指示します。
-
-```text
-$monjuを使って、この実装計画をレビューしてください。
-正しさ、作業漏れ、運用リスク、テスト範囲を重視してください。
-```
-
-```text
-$monjuを使って、このリポジトリの実装後レビューをしてください。
-リグレッション、セキュリティ、互換性を重視してください。
-```
-
-```text
-$monjuを使って、この設計文書をレビューしてください。
-曖昧な要件を特定し、重要な不確実性を解消できる実験も提案してください。
-```
-
-Codexは一意な実行フォルダ内にタスク専用のレビュー指示を作成し、Codex
-background terminalの前景コマンドとしてMonjuを実行します。そのターンでは
-待機もポーリングも行いません。別のターンで保存済み実行の確認を依頼すると、
-3件の結果を読み、重要な指摘を元資料で検証したうえで、合意点、単独の有用な
-指摘、意見の相違、未実行の実験案をまとめます。
-
-Monjuの呼び出し自体を、対象範囲の読み取り専用レビュー、preflight、成果物の
-作成、必要な場合の対象workspace限定のtrust登録に対する許可として扱います。
-Codexは実行前に会話であらためて確認しません。sandbox外実行が必要な場合は、
-対象コマンドを直接ツールへ送信し、実行基盤が必要に応じて承認ポップアップを
-表示します。認証やSSOなど、ユーザー本人の操作が本当に必要な場合だけ停止します。
-
-### ランナーの直接実行
-
-通常はCodexが自動的に実行します。Codexの非同期ワークフローでは、最初に
-preflightを実行します。
-
-```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --preflight \
-  --workspace "/absolute/path/to/workspace"
-```
-
-preflightは、該当する`~/.cursor/projects`内で一時ファイルを作成・削除して実際の
-書き込み可否を確認し、workspace固有のtrust markerとファイル認証を検証します。
-`PREFLIGHT=cursor_state_unwritable`の場合は、preflightと起動の両方をfilesystem
-sandbox外で再実行してください。`PREFLIGHT=workspace_trust_required`の場合は、
-Codexが対象workspaceを明記した限定的な実行承認をツールから直接要求し、次の
-コマンドをPTY付きでsandbox外実行します。
-
-```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-agent --workspace "/absolute/path/to/workspace" --trust
-```
-
-ユーザーがターミナルを開く必要はありません。Cursor Agentが最初のプロンプトまで
-到達したら、Codexはプロンプトを送信せずにプロセスを終了し、preflightを再実行
-します。プラットフォームの承認要求を送る前に、会話上の確認は挟みません。Monjuの
-呼び出し時点で、そのworkspaceに限定したtrust登録は許可済みとして扱います。
-承認理由には、永続的にtrust登録するworkspaceの絶対パスを明記します。
-`--yolo`や`--force`、広範な再利用可能承認、trust markerの直接編集は使いません。
-
-`PREFLIGHT=ok`の後に実行フォルダを確保します。
-
-```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --prepare \
-  --workspace "/absolute/path/to/workspace" \
-  --output-root "/absolute/path/to/output"
-```
-
-表示された`PROMPT_FILE`へレビュー指示を書き、Codex unified exec sessionを
-1つ使って、短い初回yield付きで次のコマンドを起動します。
-
-```bash
-AGENT_CLI_CREDENTIAL_STORE=file \
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
+uv run --script scripts/run_monju.py --preflight --workspace /absolute/workspace
+uv run --script scripts/run_monju.py --prepare --workspace /absolute/workspace
+uv run --script scripts/run_monju.py \
+  --tmux \
   --notify auto \
-  --workspace "/absolute/path/to/workspace" \
-  --run-dir "/RUN_DIRで表示された絶対パス" \
-  --prompt-file "/PROMPT_FILEで表示された絶対パス"
+  --workspace /absolute/workspace \
+  --run-dir /absolute/run \
+  --prompt-file /absolute/run/monju-...-00-review-brief.md
 ```
 
-runner自体をexec sessionの前景に置きます。約3秒後にツールが生存中のsession
-IDを返したら、Codexはポーリングせずターンを終了できます。管理対象background
-terminalが引き続き監督プロセスを所有します。`&`、`nohup`、`setsid`、
-`--background`は使いません。人が直接実行する場合は、レビュー完了までその
-ターミナルコマンドを動かしておく必要があります。
-
-レビュー実行中、監督プロセス自身が約30秒ごとに次の短い行をstdoutへ出力し、
-必ずflushします。
-
-```text
-MONJU_HEARTBEAT run_id=<run-id> elapsed_seconds=<n>
-```
-
-これはCodexによるポーリングではなく、runner内部の生存出力です。prompt、
-workspaceパス、Webhook URL、認証情報は含みません。idle cleanupを避けられる
-可能性はありますが、管理対象exec sessionのhard TTLには効きません。実際に
-観測された監督プロセス消失がidle cleanupとhard TTLのどちらかは未確定です。
-
-後から、待機せず状態を確認します。
+OpenCodeは`~/.local/share/opencode`と`~/.cache/opencode`へ書き込むため、sandbox外
+実行のplatform approvalが必要になる場合があります。認証がなければ次をユーザー
+自身が実行します。
 
 ```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --status \
-  --run-dir "/RUN_DIRで表示された絶対パス"
+opencode auth login --provider opencode-go
 ```
 
-マニフェストが`running`のまま監督プロセスだけ終了している場合、`--status`は
-`stale_running`に加え、`STALE_REASON`、レビュワーごとの進捗数、保存済みstaging
-パス、`RECOVERY=ready|not_ready|invalid`を表示します。initまたはfinalイベント
-があれば実処理後の外部終了、初期化がなく意味のあるstderrだけがあれば起動失敗
-と分類します。既知の`LC_ALL=C.UTF-8` locale警告はこの分類では無視します。
+runnerはrun IDと同名のtmux sessionを作り、その中でsupervisorをforegroundのまま
+維持します。commandを別のtmuxで包んだり、`&`、`nohup`、`setsid`、`--background`
+を使ったりしません。`STATUS=running`、`EXECUTION_MODE=tmux_supervisor`、
+`TMUX_SESSION_ALIVE=yes`を確認したらpollingせず、そのターンを終了します。
+`tmux_starting`も非終端状態です。約30秒ごとのheartbeatはowner-only runner logへ
+出力されます。Codexのexec-session寿命からは独立しますが、tmux server、host、
+user sessionの終了までは防げません。
 
-`RECOVERY_TERMINAL_RESULTS=3/3`かつ`RECOVERY_CAN_PUBLISH=yes`の場合だけ、保存済み
-結果を一度recoverできます。
+別ターンで一度だけ確認します。
 
 ```bash
-uv run --script "/absolute/path/to/monju/scripts/run_monju.py" \
-  --recover \
-  --run-dir "/RUN_DIRで表示された絶対パス"
+uv run --script scripts/run_monju.py --status --run-dir /absolute/run
 ```
 
-recoverはCursorや外部LLMへ接続せず、モデルの代替や再実行もしません。通常実行と
-同じ固定model allowlistとstream検証を通し、3件のMarkdownと終端manifestを公開
-します。3件のterminal eventが揃っていても`RECOVERY=invalid`なら、不正な結果は
-通常どおりpartial/failureとして記録されます。terminal eventが不足している場合は
-`recovery_not_ready`となり、manifestや成果物を変更しません。公開失敗時はraw
-stagingとpointerを保持します。終端manifest公開後の再recoverは読み取り専用の
-no-opです。`--status`が自動recoverすることはありません。no-network保証を保つ
-ため、recover時の通知は`none`（既定）またはlocalの`desktop`だけを許可し、
-`auto`と`webhook`は拒否します。
-
-ランナーのオプション:
-
-```text
---preflight             Cursor状態領域、workspace trust、認証を確認
---prepare               一意な実行フォルダと空のbriefを作成
---background            拒否。Codex background terminalの前景で実行
---status                待機せず現在の状態を表示
---recover               完了済み保存event streamを検証・公開
---run-dir PATH          準備済み実行フォルダ
---agent-bin PATH        Cursor CLI実行ファイル。既定値: agent
---timeout-seconds N     レビュワーごとの制限時間。既定値: 3600
---notify MODE           none、auto、desktop、webhook。既定値: none
---dry-run               Cursorを実行せず、正確なコマンドを表示
-```
-
-プロンプトファイルは、空ではないUTF-8 Markdownである必要があります。レビュー
-目的、正確な対象範囲、要件、制約、評価基準、除外事項、回答必須の質問を記載
-してください。
-
-### 完了通知
-
-通知は、前景の監督プロセスが終端マニフェストを公開した後に実行します。
-runnerコマンドの後ろへ別の通知コマンドをつなげず、長寿命の監督プロセス自身に
-完了通知を送らせます。
-
-| モード | 動作 |
-| --- | --- |
-| `none` | 通知しません。ランナーの既定値です。 |
-| `auto` | Webhookが設定済みならWebhook、なければローカル通知を使います。 |
-| `desktop` | 実行OSのデスクトップ通知を使います。 |
-| `webhook` | `MONJU_NOTIFY_WEBHOOK_URL`へJSONをPOSTします。 |
-
-Skillからは`--notify auto`を指定します。リモートマシンでレビューを実行し、
-手元の端末へ通知したい場合は、起動前の環境へWebhookを設定します。
+`stale_running`、`artifact_failure`、または`supervisor_failure`で全reviewerの
+terminal sidecarが揃い、`RECOVERY_CAN_PUBLISH=yes`の場合だけ次を一度実行できます。
 
 ```bash
-export MONJU_NOTIFY_WEBHOOK_URL="https://notification-service.example/hook"
+uv run --script scripts/run_monju.py --recover --run-dir /absolute/run
 ```
 
-この値はコマンド引数やレビュー指示へ書かないでください。JSON本文に含めるのは
-イベント名、終端状態、実行ID、結果フォルダ、短いメッセージだけです。ソース
-コードやレビュー本文は送信しません。ランナーは各Cursorレビューワーの
-サブプロセス環境からWebhook変数を削除します。
+recoverはOpenCodeや外部LLMを呼ばず、起動時に固定したreviewer設定、sidecar、raw
+artifactのhashだけを検証します。不足時は`not_ready`、破損や不一致は`invalid`とし、
+stagingを保持してmodelの自動retryはしません。publicationまたはsupervisorだけが
+失敗した場合は、同じ検証を通して保存済みstagingの公開を再試行できます。
 
-デスクトップ通知の実装は次のとおりです。
+`--status`はtmux runについて正確なsession名の生存も確認します。sessionが生存中は
+recoverを拒否し、PIDだけを根拠に別プロセスをMonju supervisorとは判断しません。
 
-- macOS: `osascript`。GUIログイン、通知許可が必要です。
-- Linux: `notify-send`。GUIセッション、通知デーモン、D-Busが必要です。
-- WSL2: Linux向けバックエンドを使います。`notify-send`がWindowsデスクトップ
-  へ表示されない場合があるため、Webhookを推奨します。
-- Windowsネイティブ（best effortのみ）: `msg.exe`。全セッションへ一斉送信
-  せず、現在の`USERNAME`だけを宛先にします。対象ユーザーまたはRDPセッション
-  でメッセージ受信が許可されている必要があります。
+exit code 0でtextが存在するだけではreview成功にしません。共通promptで要求した全
+sectionが揃わない進捗文だけの出力はreviewer failureとして扱います。
 
-ヘッドレス環境やリモート操作中のマシンでは、デスクトップ通知が見えない場合が
-あります。別端末で受け取る場合はWebhookを使用してください。通知はベスト
-エフォートです。`sent`、`failed`、`disabled`の結果をマニフェストの
-`notification`へ記録しますが、レビュー状態や終了コードは変更しません。
+DeepSeek V4 Flashは、中国ホスティングへの明示的opt-inがない場合、再試行不能な
+HTTP 403 `RegionError`を返すことがあります。これは想定内のreviewer failureとして
+記録し、DeepSeekを設定から外さず、ほかの結果を集約します。自動opt-in、retry、
+代替modelへの切り替えは行わず、runは通常どおりpartial/failure扱いです。
 
-### 出力ファイル
+レビュワーは`--pure`と既定denyの専用agentで動作し、read/glob/grepだけを許可します。
+`.env`と`.env.*`は拒否し、promptはargvではなくstdinで渡します。`--auto`は使いません。
 
-各実行には、UTC時刻、プロセスID、ランダム接尾辞を含む一意な実行IDが
-割り当てられます。
-
-```text
-<output-root>/
-└── monju-<UTC時刻>-p<PID>-r<nonce>/
-    ├── <run-id>-00-review-brief.md
-    ├── <run-id>-00-effective-prompt.md
-    ├── <run-id>-01-kimi-k3.md
-    ├── <run-id>-02-grok-4-5.md
-    ├── <run-id>-03-fable-5.md
-    ├── <run-id>-01-kimi-k3.events.jsonl
-    ├── <run-id>-02-grok-4-5.events.jsonl
-    ├── <run-id>-03-fable-5.events.jsonl
-    ├── <run-id>-01-kimi-k3.stderr.log
-    ├── <run-id>-02-grok-4-5.stderr.log
-    ├── <run-id>-03-fable-5.stderr.log
-    ├── <run-id>-runner.pid
-    └── <run-id>-manifest.json
-```
-
-すべてのファイル名はランナーが決定し、レビューモデルは選択・変更できません。
-既存の実行ディレクトリを上書きすることもありません。
-
-`*.md`が人間向けのレビュー結果です。イベントストリーム、標準エラーログ、
-マニフェストは診断用記録です。イベントストリームにはレビュー対象ファイルの
-抜粋が含まれる可能性があるため、機密情報として扱ってください。
-
-### 失敗時の動作
-
-マニフェストの終端状態は`success`、`partial_failure`、`failure`、
-`interrupted`、`artifact_failure`、`supervisor_failure`です。次の場合、
-該当レビュワーは明示的に失敗となります。
-
-- タイムアウトまたはCursor CLIの異常終了
-- 正常な最終結果がない
-- 既知の正規化allowlistにないモデル名が報告された
-- 禁止されたFast版が報告された
-
-一部失敗の場合も、成功したレビュー結果は保存されます。低いeffortや代替
-モデルへ自動的に切り替えることはありません。中断時はレビュワープロセスを
-終了し、利用可能な診断結果を公開します。これはWSL2にも適用されます。best
-effortのWindowsネイティブ経路では直接のCursorプロセスだけを終了し、ヘルパー
-の子孫プロセスはCursor CLI側の後始末に依存します。公開に失敗した場合は、
-可能な限り`staging_preserved`へ保存先を記録します。
-
-捕捉不能な終了や管理対象exec sessionのcleanupによって、全reviewer完了後も
-manifestが`running`のまま残る場合があります。heartbeatが扱うのはidle cleanup
-仮説だけで、safe recoveryが扱うのはすでに完成したstreamの成果物化だけです。
-どちらも原因を確定するものではなく、hard TTLを越えた生存は保証しません。
-
-トラブルシューティング:
-
-1. `--preflight`を実行します。Cursor状態領域へ書き込めない場合はsandbox外実行
-   の承認を得ます。trust未登録の場合は、Codexが限定的なsandbox外実行承認の下で
-   `agent --workspace <path> --trust`をPTY付きで実行し、preflightを再実行します。
-2. `AGENT_CLI_CREDENTIAL_STORE=file agent status`を確認し、必要なら同じ
-   環境変数を付けた`agent login`を実行します。
-3. `AGENT_CLI_CREDENTIAL_STORE=file agent models`で利用可能モデルを確認します。
-4. `<run-id>-manifest.json`で全体状態と要求・報告されたモデル名を確認します。
-5. 該当レビュワーの`*.stderr.log`と`*.events.jsonl`を確認します。
+結果集約では、現在の正しさ・security・data loss・明示契約を優先します。早すぎる
+一般化、未要求の互換性、過剰な頑健性、低確率で影響の小さいedge caseは削除せず、
+原則`Usually defer (YAGNI)`へ簡潔にまとめます。

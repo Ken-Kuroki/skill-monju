@@ -1,80 +1,62 @@
 ---
 name: monju
-description: Launch three independent, parallel, read-only Cursor CLI reviews asynchronously in a Codex background terminal with the highest non-Fast reasoning variants of Kimi K3, Grok 4.5, and Claude Fable 5, then collect and verify their results in a later conversation turn. Require structured but unexecuted experiment proposals and save private, collision-free review artifacts. Use for multi-model review, second opinions, plan review, implementation or code review, document or design review, and risk analysis.
+description: Launch configurable independent, parallel, read-only OpenCode Go reviews in a tracked persistent tmux session, then collect and verify their results in a later conversation turn. Use for multi-model review, second opinions, plan or implementation review, document or design review, and risk analysis. Require structured but unexecuted experiment proposals and save private, collision-free artifacts.
 ---
 
 # Monju
 
-Generate one neutral review brief and give the same effective prompt to three fixed
-Cursor models. Keep the foreground supervisor alive in a Codex background terminal;
-never wait for completion in the launch turn. Inspect and aggregate results only in
-a later conversation turn.
+Give one neutral brief to every reviewer configured in `reviewers.json`. Run the
+foreground supervisor inside a run-ID-named tmux session, end the launch turn
+after startup, and inspect results only in a later turn.
 
-## Authorization semantics
+## Authorization
 
-Monju may send the review brief and target-file contents read by reviewers to
-external Cursor/LLM services. Treat an explicit invocation as authorization for
-this scoped read-only workflow, its preflight and private artifacts, and, when
-required, Cursor Workspace Trust for the exact workspace with `--trust`. This
-authorization does not override Codex platform or Auto-review policy. Never ask
-for a conversational confirmation such as "Should I proceed?" before taking
-those actions.
+Monju may send the brief and target files read by reviewers to OpenCode Go and
+its external LLM services. Treat an explicit skill invocation as authorization
+for this scoped read-only workflow, preflight, private artifacts, and its exact
+run-ID-named tmux session. Do not ask for an additional conversational
+confirmation. This authorization does not override Codex platform or
+Auto-review policy.
 
-If filesystem sandbox escalation is required, submit the tool call immediately
-with a precise platform approval request. Let the configured platform approval
-path handle that decision; do not precede it with a chat question or consume a
-separate turn. Stop only when the user must actually provide missing information
-or complete an action, such as browser authentication or SSO.
+When filesystem escalation is needed, submit the tool call immediately with a
+precise platform approval request. Stop only when the user must supply missing
+information or complete OpenCode authentication.
 
 ## Launch turn
 
 1. Identify the workspace and exact review scope. Read enough source material to
-   write a self-contained brief without including Codex's conclusions.
-2. Resolve this skill directory as `<monju-skill-dir>` and the default output root
-   as `<absolute-workspace>/monju-reviews`.
-3. Run the deterministic preflight before creating a run:
+   write a self-contained neutral brief without including Codex's conclusions.
+2. Resolve this skill directory as `<monju-skill-dir>` and use
+   `<absolute-workspace>/monju-reviews` as the default output root.
+3. Run preflight before creating a run:
 
    ```bash
-   AGENT_CLI_CREDENTIAL_STORE=file \
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
      --preflight \
      --workspace "<absolute-workspace>"
    ```
 
-4. Handle preflight failures without weakening Cursor protections:
-   - For `PREFLIGHT=cursor_state_unwritable`, immediately submit an escalated
-     tool call to rerun the preflight outside the filesystem sandbox. Do not ask
-     for permission in chat first; the configured platform approval path is the
-     only approval step. Use the same outside-sandbox execution for the eventual
-     foreground launch. Do not wait for Cursor to fail with `EPERM` under
-     `~/.cursor/projects`.
-   - For `PREFLIGHT=workspace_trust_required`, do not ask the user to open a
-     terminal or ask for conversational confirmation. The skill invocation
-     authorizes trust registration for this exact workspace. Immediately submit
-     a narrowly scoped platform approval request to run this exact command
-     outside the filesystem sandbox with a PTY:
+4. Handle preflight failures without weakening protections:
+   - For `PREFLIGHT=opencode_state_unwritable`, immediately rerun preflight
+     outside the filesystem sandbox through the platform approval path. Use the
+     same approval boundary for the eventual launch. OpenCode writes under
+     `~/.local/share/opencode` and `~/.cache/opencode` even for simple commands.
+   - For `PREFLIGHT=tmux_state_unwritable`, rerun preflight and launch through
+     the same outside-sandbox approval. tmux uses its user-owned socket under a
+     temporary directory. Treat a missing tmux executable as a local dependency
+     failure; do not replace it with `nohup`, `setsid`, `&`, or `--background`.
+     `TMUX_SERVER=existing` uses the current user server;
+     `TMUX_SERVER=absent` is not an error because `--tmux` creates it with the
+     review session.
+   - For `PREFLIGHT=opencode_auth_required`, ask the user to complete:
 
      ```bash
-     AGENT_CLI_CREDENTIAL_STORE=file \
-     agent --workspace "<absolute-workspace>" --trust
+     opencode auth login --provider opencode-go
      ```
 
-     State in the approval reason that this persistently trusts exactly the
-     displayed workspace in Cursor. Do not request a reusable broad command
-     approval. Once the Cursor Agent reaches its initial prompt, interrupt and
-     close that process without submitting a prompt, then rerun the preflight
-     outside the sandbox. If trust is still absent, report the command output and
-     stop instead of retrying indefinitely. Never suggest `--yolo` or `--force`,
-     and never create or edit Cursor's trust marker directly.
-   - If authentication fails, stop and ask the user to run this command and
-     complete browser authentication:
-
-     ```bash
-     AGENT_CLI_CREDENTIAL_STORE=file agent login
-     ```
-
-     Never request or handle the user's password. Rerun the preflight after the
-     user confirms.
+     Never request or handle an API key or password. Rerun preflight afterward.
+   - Treat missing models or variants as configuration failures. Never substitute
+     a model, lower reasoning effort, use automatic routing, or retry indefinitely.
 
 5. Prepare a unique run directory after `PREFLIGHT=ok`:
 
@@ -85,69 +67,59 @@ or complete an action, such as browser authentication or SSO.
      --output-root "<absolute-output-root>"
    ```
 
-6. Write the brief to the exact `PROMPT_FILE` printed by the command. Keep it
-   inside that run directory. Include the objective, review type, exact scope,
-   requirements, constraints, criteria, exclusions, and required questions.
-   Include the actual support matrix and risk tolerance when known; do not imply
-   enterprise-scale, safety-critical, or speculative future requirements.
-   Exclude `monju-reviews/` and the current run's generated artifacts from the
-   reviewers' inspection scope.
-7. Start the run using one Codex unified `exec_command` session with a short
-   initial yield. Keep the runner itself in that session's foreground. If step 4
-   required outside-sandbox execution, directly request or reuse the platform
-   approval on this tool call without asking in chat first:
+6. Write the neutral brief to the exact `PROMPT_FILE`. Include the objective,
+   review type, exact scope, requirements, constraints, exclusions, risk
+   tolerance, and questions to answer. Exclude `monju-reviews/` and generated
+   artifacts from inspection.
+7. Ask the runner to create one run-ID-named tmux session containing the
+   foreground supervisor, using the same outside-sandbox approval if preflight
+   required it:
 
    ```bash
-   AGENT_CLI_CREDENTIAL_STORE=file \
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
+     --tmux \
      --notify auto \
      --workspace "<absolute-workspace>" \
      --run-dir "<absolute-run-dir>" \
      --prompt-file "<absolute-prompt-file>"
    ```
 
-   Set `yield_time_ms` to about 3000 so immediate failures can finish visibly.
-   A still-running tool result must return a live exec session ID; that Codex
-   background terminal, not a detached Python subprocess, owns the supervisor
-   until completion. Do not append `&`, use `nohup` or `setsid`, pass
-   `--background`, or send the supervisor into another process tree. If unified
-   exec cannot retain a live session, stop instead of using a detach fallback.
-   While reviewers are active, the runner itself emits a short flushed
-   `MONJU_HEARTBEAT` line about every 30 seconds. This is internal supervisor
-   liveness output, not Codex polling, and contains no prompt, workspace, or
-   credential data. It may avoid an idle cleanup, but does not protect against
-   a hard exec-session TTL; the observed cleanup cause is not yet known.
-8. Do not ask for an extra review confirmation at any point in this workflow.
-   A platform-enforced approval may surface to the user or go to Auto-review,
-   but it must not be preceded by a conversational yes/no question.
-9. If the command yields with a live exec session and prints `STATUS=running` plus
-   `EXECUTION_MODE=foreground_supervisor`, report the saved run directory and
-   end the turn. Do not call `write_stdin`, poll the session, read intermediate
-   streams, or start another run. If the command exits during the initial yield,
-   report its terminal status as an immediate launch result instead.
+   Do not wrap this command in another tmux command. Never append `&`, use
+   `nohup` or `setsid`, or pass `--background`. The launcher checks the exact
+   session name, starts the supervisor without a shell, and waits only for the
+   running manifest. The tmux session closes automatically when the supervisor
+   reaches a terminal state.
+
+   The supervisor emits a flushed `MONJU_HEARTBEAT` about every 30 seconds to
+   its owner-only runner log. This is internal liveness evidence, not Codex
+   polling. tmux removes the Codex exec-session TTL from the review process, but
+   cannot survive the tmux server, host, or user session being terminated.
+8. Do not ask for an extra review confirmation. Platform approval may still be
+   shown to the user or Auto-review.
+9. When the command returns `STATUS=running`,
+   `EXECUTION_MODE=tmux_supervisor`, and `TMUX_SESSION_ALIVE=yes`, report the run
+   directory and session name, then end the turn. `STATUS=tmux_starting` is also
+   non-terminal; report it and stop. Do not poll, read intermediate streams, or
+   launch a second run. Report a startup or terminal result returned directly.
 
 ## Auto-review denial
 
-Do not preemptively stop merely because `approvals_reviewer` is `auto_review` or
-its legacy alias `guardian_subagent`; public or sanitized material may pass.
-Proceed to one normal platform approval attempt. If that attempt explicitly
-denies the launch as private-data export to an untrusted external destination:
+Do not stop merely because `approvals_reviewer` is `auto_review` or its legacy
+alias `guardian_subagent`; public or sanitized material may pass. Attempt the
+normal platform approval once. If it explicitly denies private-data export to an
+untrusted external destination:
 
-- Treat it as a Codex platform denial, not an authentication, network, trust,
-  subscription, or model failure. If the launch `exec_command` is denied before
-  process creation, report that no reviewer subprocess started and no review
-  content was sent to Cursor/LLM services.
-- Do not infer an administrator-managed policy from the phrase `tenant policy`;
-  the default generic Auto-review policy can also deny this on personal accounts.
+- Report a Codex platform denial, not an OpenCode authentication, network,
+  subscription, or model failure. If denied before process creation, say no
+  reviewer started and no review content was sent.
+- Do not infer an administrator-managed policy from `tenant policy`; default
+  Auto-review policy can deny this on personal accounts.
 - Do not retry in the same turn, route around the denial, use indirect execution,
-  or edit configuration automatically. Conversational reapproval can still meet
-  an absolute deny, so do not repeatedly ask for it.
-- Explain the counterintuitive recovery plainly: **Approve for me** sends the
-  request to Auto-review, whose absolute private-data rule may deny it, while
-  **Ask for approval** keeps the same `workspace-write` sandbox but sends the
-  decision to the user. The apparently stricter, more interactive setting can
-  therefore succeed. This changes who approves, not the sandbox protection.
-  Offer this configuration:
+  or edit configuration automatically. Do not repeatedly request conversational
+  approval after an absolute deny.
+- Explain that **Approve for me** routes to Auto-review, while **Ask for
+  approval** routes the decision to the user without disabling the
+  `workspace-write` sandbox. Recommend:
 
   ```toml
   approval_policy = "on-request"
@@ -155,19 +127,10 @@ denies the launch as private-data export to an untrusted external destination:
   sandbox_mode = "workspace-write"
   ```
 
-  In the currently reported App UI, **Ask for approval** maps to `user` and
-  **Approve for me** maps to `auto_review`; verify current UI/documentation
-  before stating that mapping because labels may change. After changing it,
-  restart the Codex App and start a new thread/session; do not assume an existing
-  thread inherited the change.
-- If diagnosis is needed, inspect only `approval_policy`, `approvals_reviewer`,
-  `sandbox_mode`, and `[auto_review]` read-only; never display a potentially
-  secret-bearing `config.toml` in full. If the value returns to
-  `guardian_subagent`, describe Desktop write-back only as a possibility. Record
-  the App/CLI version, those keys before and after, and the file modification
-  time, then report it to the applicable known issue or support.
+  UI labels may change. Verify current behavior before asserting the mapping.
+  Restart Codex and begin a new thread after changing it.
 - Never recommend `danger-full-access`, `--yolo`, or
-  `approval_policy = "never"` as the standard fix.
+  `approval_policy = "never"` as the standard solution.
 
 ## Result-check turn
 
@@ -179,21 +142,14 @@ denies the launch as private-data export to an untrusted external destination:
      --run-dir "<absolute-run-dir>"
    ```
 
-2. If status is `prepared` or `running`, report it and stop. Do not block or poll.
-   For `stale_running`, use `STALE_REASON`, `STALE_PROGRESS`, and
-   `STAGING_PRESERVED` from the status output:
-   - `external_termination_after_startup` or
-     `external_termination_after_results` means reviewers made verified progress
-     before the supervisor was externally killed; do not call this a startup
-     failure.
-   - `startup_failure` means no reviewer initialized and meaningful startup
-     diagnostics were recorded.
-   - `external_termination_before_startup` means the supervisor disappeared
-     before useful reviewer evidence was written.
-
-   Also use `RECOVERY`, `RECOVERY_TERMINAL_RESULTS`, and
-   `RECOVERY_CAN_PUBLISH`:
-   - Only when all three terminal result events exist and
+2. If status is `prepared`, `tmux_starting`, or `running`, report it and stop.
+   For tmux runs, use `TMUX_SESSION_ALIVE`; do not infer failure from the old
+   Codex exec session or poll repeatedly.
+3. For `stale_running`, use `STALE_REASON`, `STALE_PROGRESS`,
+   `STAGING_PRESERVED`, and `RECOVERY`. For `artifact_failure` or
+   `supervisor_failure`, use the preserved staging and `RECOVERY` fields without
+   treating the run as published:
+   - If every configured reviewer has a verified terminal marker and
      `RECOVERY_CAN_PUBLISH=yes`, run recovery once:
 
      ```bash
@@ -202,134 +158,121 @@ denies the launch as private-data export to an untrusted external destination:
        --run-dir "<absolute-run-dir>"
      ```
 
-     `RECOVERY=ready` means all three streams passed validation.
-     `RECOVERY=invalid` with `RECOVERY_CAN_PUBLISH=yes` means all terminal
-     events exist but at least one malformed stream, Cursor error, or model
-     verification failure will be published as a normal partial/failure result.
-   - For `RECOVERY=not_ready`, or `invalid` with
-     `RECOVERY_CAN_PUBLISH=no`, preserve raw staging and stop. Do not infer
-     missing results, automatically retry, or start replacement reviewers.
+   - `RECOVERY=ready` means all streams are successful and valid.
+   - `RECOVERY=invalid` with `RECOVERY_CAN_PUBLISH=yes` means all reviewer
+     processes completed, but one or more verified results will be published as
+     a normal failure because of an OpenCode error or malformed output.
+   - For `RECOVERY=not_ready`, or invalid with `RECOVERY_CAN_PUBLISH=no`, preserve
+     staging and stop. Never infer missing output, relaunch, or auto-retry.
 
-   Recovery reads only preserved artifacts. It does not invoke Cursor, contact
-   an external LLM, or retry a reviewer. Inspect preserved event and stderr
-   files only for this stale diagnosis, report the distinction, and do not
-   auto-retry.
-3. For a terminal manifest status, read the manifest and the three generated review
-   `*.md` files. Treat `*.events.jsonl` and stderr logs as diagnostics only.
-4. Report:
-   - act-now findings supported by multiple successful reviewers;
-   - useful act-now findings unique to one reviewer;
+   Recovery reads only preserved artifacts and never invokes OpenCode or an
+   external LLM. It verifies frozen reviewer configuration, terminal markers,
+   and artifact hashes. It can retry publication after `artifact_failure` or
+   `supervisor_failure` only when the same validation succeeds. A genuinely
+   published terminal manifest makes repeated recovery a read-only no-op.
+   Treat DeepSeek V4 Flash's non-retryable HTTP 403 `RegionError` saying that
+   the latest model is hosted only in China and requires explicit opt-in as an
+   expected reviewer failure. Keep the reviewer configured, report the failure,
+   and aggregate the other results. Do not opt in, retry, or substitute a model
+   automatically. Expected here means operationally anticipated, not successful;
+   the run remains a normal partial/failure result.
+4. For terminal status, read the manifest and all generated review Markdown.
+   Treat JSONL, stderr, terminal markers, and worker task files as diagnostics.
+5. Aggregate:
+   - supported act-now findings;
+   - useful unique act-now findings;
    - a compact `Usually defer (YAGNI)` section for premature abstraction,
-     unstated compatibility, disproportionate robustness, and low-impact unlikely
-     edge cases, even when multiple reviewers mention them;
+     unstated compatibility, disproportionate robustness, and unlikely
+     low-impact edge cases;
    - disagreements and uncertainty;
-   - proposed experiments, deduplicated, labeled unexecuted, and split into
-     act-now versus usually-defer based on present decision value;
-   - failed reviewer reasons and the saved run directory.
-5. Verify material findings against the reviewed source before presenting them
-   as facts. Never present a predicted experiment outcome as observed evidence.
-   Do not execute experiments or implement fixes without separate authorization.
-6. Reassess each reviewer's disposition rather than copying it mechanically.
-   Prioritize current requirements, realistic likelihood and impact, implementation
-   cost, conceptual complexity, and readability. Do not promote an item merely
-   because several reviewers found it or because a worst case can be imagined.
-7. Account for every non-duplicate reviewer finding as act-now, usually-defer,
-   disagreement or uncertainty, or rejected after source verification. Deduplicate
-   overlaps and keep non-actionable categories compact, but do not silently drop
-   premature-generalization, compatibility, robustness, or edge-case findings.
-8. Keep likely correctness, security, irreversible data-loss, and explicit-contract
-   problems in the act-now section. Also keep a current readability problem there
-   when a small localized correction reduces conceptual complexity; defer stylistic
-   preferences and high-churn rewrites. Put speculative future-proofing elsewhere
-   and omit it from recommended next actions unless the user explicitly asks to
-   implement deferred work.
+   - deduplicated, unexecuted experiments split into act-now and usually-defer;
+   - reviewer failures and the run directory.
+6. Verify material findings against source before presenting them as facts.
+   Never present predicted experiment outcomes as observed evidence, execute an
+   experiment, or implement fixes without separate authorization.
+7. Account for every non-duplicate finding as act-now, usually-defer,
+   disagreement/uncertainty, or rejected after source verification. Favor clear,
+   direct code and the smallest coherent fix. Keep likely correctness, security,
+   irreversible data-loss, explicit-contract, and small high-value readability
+   problems in act-now.
 
-## Fixed review configuration
+## Reviewer configuration
 
-The runner alone constructs reviewer commands:
+`reviewers.json` is the source of truth for new runs. Each entry has a unique
+safe `key`, `display_name`, exact `opencode-go/...` model ID, and optional exact
+`variant`. Array order determines artifact numbering. The shipped configuration
+uses:
 
 ```text
-agent -p --mode=ask --model <fixed-model-spec> --output-format stream-json <effective-prompt>
+Kimi K3:          opencode-go/kimi-k3 / max
+Grok 4.5:         opencode-go/grok-4.5 / high
+DeepSeek V4 Flash: opencode-go/deepseek-v4-flash / max
+GLM 5.2:          opencode-go/glm-5.2 / max
+Qwen3.8 Max:      opencode-go/qwen3.8-max / max
 ```
+
+The count is configurable rather than fixed in the runner. Preflight verifies
+every model and variant against `opencode models opencode-go --verbose`. The
+highest variant is model-specific: Grok 4.5 uses `high`, while the other shipped
+reviewers use `max`; do not assume every model uses the literal variant `max`.
+
+The runner constructs commands equivalent to:
 
 ```text
-Kimi K3:        kimi-k3-max
-Grok 4.5:       cursor-grok-4.5-high
-Claude Fable 5: claude-fable-5-thinking-max
+opencode --pure run --format json --model <model> --agent monju-review
+  --dir <workspace> [--variant <variant>]
 ```
 
-Run exactly these three top-level reviewers concurrently. Do not use Fast,
-UltraCode-like parallel-compute variants, Auto routing, lower-effort fallback,
-replacement models, bracket overrides, or extra reviewer agents. If a requested
-model is unavailable, preserve that failure without substitution.
+It passes the prompt through stdin and never passes `--auto`. The inline
+`monju-review` agent denies all tools by default, allows read/glob/grep, denies
+`.env` and `.env.*`, and permits `.env.example` only.
 
 ## Guarantees and failures
 
-- Use Ask mode and prohibit reviewer file changes, mutating commands, and
-  subagent delegation.
-- Keep reviewer streams outside the workspace until all reviewers finish to
-  reduce accidental cross-review contamination. Treat this as workflow
-  separation, not a hard same-user security boundary.
-- Require each reviewer either to provide structured, unexecuted experiment
-  proposals with procedures, side effects, multiple outcomes, and
-  interpretations, or to state that no experiment is warranted.
-- Require YAGNI-aware disposition without suppressing findings. Favor the smallest
-  coherent fix and a clear conceptual surface over premature generalization or
-  maximum theoretical robustness.
-- Verify the `system/init` model against the normalized allowlist of observed
-  maximum-quality model IDs and display names. Fail visibly on any unknown name.
-- Keep the supervisor in the foreground of a Codex unified-exec background
-  terminal. Never rely on `start_new_session`, `nohup`, `setsid`, or a detached
-  Python child to outlive the launch turn. Treat the live exec session as the
-  process-ownership boundary, not a guarantee against idle cleanup or a hard
-  TTL, and do not poll it. The runner emits its own bounded heartbeat while
-  waiting and stops that heartbeat on completion, interruption, or failure.
-- Recover only a dead supervisor's preserved streams after all three terminal
-  result events exist. Refuse a live supervisor, never relaunch an external
-  reviewer, leave incomplete or unpublishable invalid raw staging intact, and
-  make repeated recovery against a published terminal manifest a no-op.
-- Before launch, probe actual write access to the relevant Cursor project state
-  directory, verify the workspace-specific trust marker, and check file-store
-  authentication. On an untrusted workspace, let Codex run Cursor's dedicated
-  `--trust` operation through a narrowly approved outside-sandbox PTY; do not
-  require the user to open a terminal. Never bypass trust with `--yolo` or
-  `--force` or by editing the marker directly.
-- Treat WSL2 as the supported Windows execution path; it uses Linux/POSIX
-  behavior. Prefer the WSL Linux filesystem for the workspace and output root,
-  and prefer a webhook when completion must be visible outside the WSL session.
-  Do not present native PowerShell or CMD execution as supported end to end.
-- Save run artifacts with owner-only modes on POSIX and preserve staging on
-  publication failure or interruption. Native-Windows branches are best effort
-  only; if used, require an output root protected by an owner-only DACL.
-- Treat completion notifications as best effort. `--notify auto` uses the webhook
-  URL in `MONJU_NOTIFY_WEBHOOK_URL` when configured; otherwise it uses the local
-  desktop mechanism. In WSL2 this is the Linux backend and may not surface on the
-  Windows desktop; native `msg.exe` support is best effort only. Never place a
-  webhook URL or token in command arguments, briefs, logs, or review artifacts.
-  The runner removes this variable from each reviewer subprocess environment.
-- Send only the terminal status, run ID, and result directory in notifications.
-  Record notification success or failure in the manifest without changing the
-  review status or exit code.
-- Surface authentication, network, subscription, regional, retention, timeout,
-  invalid-model, supervisor, and malformed-result failures without fallback.
-- In the best-effort native-Windows path, state that interruption reliably
-  terminates direct reviewer processes but descendant cleanup depends on Cursor
-  CLI behavior. WSL2 uses POSIX process-group termination.
-- The Cursor CLI currently accepts the effective prompt only as an argument. The
-  runner rejects oversized prompts but local process listings may expose brief
-  text; keep briefs scoped and avoid embedding unnecessary secrets.
+- Freeze reviewer configuration and catalog verification in schema-v3 running
+  manifests so later edits to `reviewers.json` cannot change status or recovery.
+- Keep the supervisor as the foreground command of an exact run-ID-named tmux
+  session. The launcher itself returns after the running manifest exists; it
+  does not remain responsible for process lifetime. Direct foreground execution
+  remains available for diagnostics but is not the skill launch path. Handle
+  tmux SIGHUP like SIGTERM so session shutdown stops reviewer process groups.
+- Run one internal worker per reviewer. Each worker writes an atomic terminal
+  sidecar containing the exact model/variant, exit state, timing, and hashes of
+  raw artifacts. This enables safe recovery if the supervisor disappears after
+  workers finish. It does not guarantee worker survival when the platform kills
+  the entire process tree.
+- Require non-empty OpenCode output to contain every section mandated by the
+  review prompt before classifying it as success. Treat progress-only text as a
+  reviewer failure rather than a completed review.
+- Keep streams outside the reviewed workspace until all reviewers finish. This
+  is workflow separation, not a hard same-user security boundary.
+- Save artifacts with owner-only POSIX modes and preserve staging on interruption
+  or publication failure.
+- Remove `MONJU_NOTIFY_WEBHOOK_URL` from reviewer environments. Notifications
+  contain only terminal status, run ID, and result directory. For tmux launch,
+  transfer a configured webhook through the runner's transient owner-only
+  handoff file; the supervisor deletes it before preflight. Never put the secret
+  in argv, manifests, published artifacts, or reviewer environments.
+  Notification failure never changes review status.
+- Surface authentication, state access, network, subscription, region,
+  retention, timeout, invalid model/variant, malformed output, supervisor, and
+  publication failures without fallback.
+- Treat WSL2 as the supported Windows route; native Windows remains best effort.
 
 ## Runner commands
 
 ```text
---preflight             Check Cursor state access, workspace trust, and authentication
+--preflight             Check tmux, OpenCode state, auth, models, and variants
 --prepare               Create a unique run directory and empty brief
---background            Rejected; use a foreground Codex background terminal
+--tmux                  Launch the foreground supervisor in a tracked tmux session
+--tmux-bin PATH         tmux CLI; default: PATH lookup
+--background            Rejected; use --tmux
 --status                Read run status without waiting
---recover               Validate and publish completed preserved event streams
+--recover               Validate and publish completed preserved artifacts
 --run-dir PATH          Prepared run directory
---agent-bin PATH        Cursor CLI executable; default: agent
+--opencode-bin PATH     OpenCode CLI; PATH then ~/.opencode/bin/opencode
+--reviewers-file PATH   Reviewer JSON; default: <skill-dir>/reviewers.json
 --timeout-seconds N     Per-reviewer timeout; default: 3600
 --notify MODE           none, auto, desktop, or webhook; default: none
---dry-run               Print reviewer command templates without invoking Cursor
+--dry-run               Print commands without invoking OpenCode
 ```
