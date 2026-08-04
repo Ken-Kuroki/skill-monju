@@ -334,7 +334,7 @@ solution.
 --run-dir PATH          Prepared run directory
 --opencode-bin PATH     OpenCode executable
 --reviewers-file PATH   Reviewer JSON configuration
---timeout-seconds N     Per-reviewer timeout; default 3600
+--timeout-seconds N     Per-reviewer timeout; default 7200
 --notify MODE           none, auto, desktop, or webhook
 --dry-run               Print commands without invoking OpenCode
 ```
@@ -657,7 +657,7 @@ sandbox_mode = "workspace-write"
 --run-dir PATH          prepare済みrun directory
 --opencode-bin PATH     OpenCode executable
 --reviewers-file PATH   レビュアーJSON設定
---timeout-seconds N     レビュアーごとのtimeout。既定3600秒
+--timeout-seconds N     レビュアーごとのtimeout。既定7200秒
 --notify MODE           none、auto、desktop、webhook
 --dry-run               OpenCodeを起動せずcommandを表示
 ```

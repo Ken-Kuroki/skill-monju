@@ -48,6 +48,7 @@ BACKEND = "opencode"
 PROVIDER = "opencode-go"
 MONJU_AGENT_NAME = "monju-review"
 DEFAULT_REVIEWERS_FILE = Path(__file__).resolve().parents[1] / "reviewers.json"
+DEFAULT_REVIEWER_TIMEOUT_SECONDS = 7200
 
 PROMPT_ENVELOPE = """\
 You are one independent reviewer in a parallel review-only workflow named Monju.
@@ -339,7 +340,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REVIEWERS_FILE,
         help="Reviewer configuration JSON; defaults to the skill's reviewers.json.",
     )
-    parser.add_argument("--timeout-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_REVIEWER_TIMEOUT_SECONDS,
+    )
     parser.add_argument(
         "--notify",
         choices=("none", "auto", "desktop", "webhook"),

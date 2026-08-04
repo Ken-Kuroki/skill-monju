@@ -277,7 +277,7 @@ It passes the prompt through stdin and never passes `--auto`. The inline
 --run-dir PATH          Prepared run directory
 --opencode-bin PATH     OpenCode CLI; PATH then ~/.opencode/bin/opencode
 --reviewers-file PATH   Reviewer JSON; default: <skill-dir>/reviewers.json
---timeout-seconds N     Per-reviewer timeout; default: 3600
+--timeout-seconds N     Per-reviewer timeout; default: 7200
 --notify MODE           none, auto, desktop, or webhook; default: none
 --dry-run               Print commands without invoking OpenCode
 ```

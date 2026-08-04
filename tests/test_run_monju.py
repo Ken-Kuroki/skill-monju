@@ -295,6 +295,11 @@ class RunnerTestCase(unittest.TestCase):
             ],
         )
 
+    def test_default_reviewer_timeout_is_two_hours(self) -> None:
+        with mock.patch.object(sys, "argv", [str(SCRIPT)]):
+            args = run_monju.parse_args()
+        self.assertEqual(args.timeout_seconds, 7200)
+
     def test_configuration_supports_one_and_four_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -360,7 +365,7 @@ class RunnerTestCase(unittest.TestCase):
                 self.assertEqual(handoff.stat().st_mode & 0o777, 0o600)
                 args = argparse.Namespace(
                     reviewers_file=REPOSITORY / "reviewers.json",
-                    timeout_seconds=3600,
+                    timeout_seconds=run_monju.DEFAULT_REVIEWER_TIMEOUT_SECONDS,
                     notify="auto",
                 )
                 command = run_monju.tmux_supervisor_command(
