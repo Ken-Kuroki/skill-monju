@@ -43,6 +43,7 @@ class FlushRecorder(io.StringIO):
 
 class RunnerTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        run_monju.configure_backend("opencode")
         reviewers, config_hash = run_monju.load_reviewer_configuration(
             REPOSITORY / "reviewers.json"
         )
@@ -180,6 +181,61 @@ class RunnerTestCase(unittest.TestCase):
         return fake
 
     @staticmethod
+    def make_fake_cursor(root: Path) -> Path:
+        fake = root / "agent"
+        fake.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+
+                args = sys.argv[1:]
+                if args == ["status"]:
+                    print("Logged in")
+                    raise SystemExit(0)
+                if args == ["models"]:
+                    print("kimi-k3-max")
+                    print("cursor-grok-4.5-high")
+                    print("claude-fable-5-thinking-max")
+                    raise SystemExit(0)
+                if "--mode=ask" not in args or "--output-format" not in args:
+                    print("unsafe or incomplete Cursor command", file=sys.stderr)
+                    raise SystemExit(65)
+                if os.environ.get("MONJU_NOTIFY_WEBHOOK_URL"):
+                    print("webhook secret leaked", file=sys.stderr)
+                    raise SystemExit(67)
+                model = args[args.index("--model") + 1]
+                prompt = args[-1]
+                if "<BEGIN_MONJU_REVIEW_BRIEF>" not in prompt:
+                    print("prompt missing from Cursor argv", file=sys.stderr)
+                    raise SystemExit(69)
+                reported = {{
+                    "kimi-k3-max": "Kimi K3 Max",
+                    "cursor-grok-4.5-high": "Cursor Grok 4.5 High",
+                    "claude-fable-5-thinking-max": "Fable 5 300K Max",
+                }}[model]
+                print(json.dumps({{
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "cursor-session-" + model,
+                    "model": reported,
+                }}), flush=True)
+                print(json.dumps({{
+                    "type": "result",
+                    "subtype": "success",
+                    "session_id": "cursor-session-" + model,
+                    "result": {REVIEW_TEXT!r},
+                }}), flush=True)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake
+
+    @staticmethod
     def make_fake_tmux(root: Path) -> Path:
         fake = root / "tmux"
         pid_file = root / "fake-tmux-session.pid"
@@ -250,8 +306,23 @@ class RunnerTestCase(unittest.TestCase):
         command_env = self.command_env(home, config)
         if env:
             command_env.update(env)
+        command = [sys.executable, str(SCRIPT), "--reviewers-file", str(config), *args]
+        inactive_modes = {
+            "--prepare",
+            "--status",
+            "--recover",
+            "--manual-handoff",
+            "--background",
+        }
+        needs_reviewers = not inactive_modes.intersection(args)
+        if needs_reviewers:
+            command.extend(["--backend", "opencode"])
+            if "--reviewer" not in args:
+                payload = json.loads(config.read_text(encoding="utf-8"))
+                for reviewer in payload["reviewers"]:
+                    command.extend(["--reviewer", reviewer["key"]])
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--reviewers-file", str(config), *args],
+            command,
             cwd=REPOSITORY,
             env=command_env,
             text=True,
@@ -300,6 +371,193 @@ class RunnerTestCase(unittest.TestCase):
             args = run_monju.parse_args()
         self.assertEqual(args.timeout_seconds, 7200)
 
+    def test_backend_and_exact_reviewer_are_required(self) -> None:
+        missing_backend = subprocess.run(
+            [sys.executable, str(SCRIPT), "--preflight"],
+            cwd=REPOSITORY,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(missing_backend.returncode, 0)
+        self.assertIn("--backend cursor or --backend opencode", missing_backend.stderr)
+
+        missing_reviewer = subprocess.run(
+            [sys.executable, str(SCRIPT), "--backend", "opencode", "--preflight"],
+            cwd=REPOSITORY,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(missing_reviewer.returncode, 0)
+        self.assertIn("select each exact model explicitly", missing_reviewer.stderr)
+        self.assertIn("kimi-k3=opencode-go/kimi-k3/max", missing_reviewer.stderr)
+
+    def test_cursor_preflight_and_review_use_exact_reported_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            projects = home / ".cursor" / "projects" / "trusted-project"
+            projects.mkdir(parents=True)
+            (projects / ".workspace-trusted").write_text(
+                json.dumps({"workspacePath": str(workspace)}),
+                encoding="utf-8",
+            )
+            cursor_config = REPOSITORY / "cursor_reviewers.json"
+            fake_cursor = self.make_fake_cursor(root)
+            fake_tmux = self.make_fake_tmux(root)
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+
+            preflight = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--backend",
+                    "cursor",
+                    "--reviewer",
+                    "kimi-k3",
+                    "--reviewers-file",
+                    str(cursor_config),
+                    "--preflight",
+                    "--workspace",
+                    str(workspace),
+                    "--agent-bin",
+                    str(fake_cursor),
+                    "--tmux-bin",
+                    str(fake_tmux),
+                ],
+                cwd=REPOSITORY,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(preflight.returncode, 0, preflight.stderr)
+            self.assertIn("BACKEND=cursor", preflight.stdout)
+            self.assertIn("REVIEWER_KEYS=kimi-k3", preflight.stdout)
+
+            prepare = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--prepare",
+                    "--workspace",
+                    str(workspace),
+                    "--output-root",
+                    str(root / "reviews"),
+                ],
+                cwd=REPOSITORY,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(prepare.returncode, 0, prepare.stderr)
+            run_dir = Path(self.parse_key(prepare.stdout, "RUN_DIR"))
+            prompt = Path(self.parse_key(prepare.stdout, "PROMPT_FILE"))
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            review = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--backend",
+                    "cursor",
+                    "--reviewer",
+                    "kimi-k3",
+                    "--reviewers-file",
+                    str(cursor_config),
+                    "--workspace",
+                    str(workspace),
+                    "--run-dir",
+                    str(run_dir),
+                    "--prompt-file",
+                    str(prompt),
+                    "--agent-bin",
+                    str(fake_cursor),
+                ],
+                cwd=REPOSITORY,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(review.returncode, 0, review.stderr)
+            manifest = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["backend"], "cursor")
+            self.assertEqual(manifest["parallel_reviewer_count"], 1)
+            result = manifest["results"][0]
+            self.assertEqual(result["reported_model"], "Kimi K3 Max")
+            self.assertTrue(result["model_verified"])
+            self.assertEqual(result["command"][-1], "<effective-prompt>")
+
+    def test_cursor_configuration_rejects_fast_or_unverifiable_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "cursor-reviewers.json"
+            run_monju.configure_backend("cursor")
+            config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "provider": "cursor",
+                        "reviewers": [
+                            {
+                                "key": "unsafe",
+                                "display_name": "Unsafe",
+                                "model_id": "some-fast-model",
+                                "allowed_reported_models": ["some-fast-model"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit):
+                run_monju.load_reviewer_configuration(config)
+
+            payload = json.loads(config.read_text(encoding="utf-8"))
+            payload["reviewers"][0]["model_id"] = "safe-thinking-max"
+            payload["reviewers"][0]["allowed_reported_models"] = ["different-model"]
+            config.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                run_monju.load_reviewer_configuration(config)
+
+    def test_cursor_tmux_command_preserves_backend_and_model_selection(self) -> None:
+        run_monju.configure_backend("cursor")
+        configured, _ = run_monju.load_reviewer_configuration(
+            REPOSITORY / "cursor_reviewers.json"
+        )
+        reviewers, config_hash = run_monju.select_configured_reviewers(
+            configured,
+            ["grok-4-5"],
+        )
+        run_monju.configure_reviewers(reviewers, config_hash)
+        run_dir = Path("/tmp/monju-cursor-tmux-test")
+        args = argparse.Namespace(
+            reviewers_file=REPOSITORY / "cursor_reviewers.json",
+            timeout_seconds=run_monju.DEFAULT_REVIEWER_TIMEOUT_SECONDS,
+            notify="none",
+            reviewer_keys=["grok-4-5"],
+        )
+        command = run_monju.tmux_supervisor_command(
+            args,
+            Path("/workspace"),
+            run_dir,
+            run_dir / "monju-cursor-tmux-test-00-review-brief.md",
+            "/bin/agent",
+            run_dir.name,
+            None,
+        )
+        self.assertIn("cursor", command)
+        self.assertIn("--agent-bin", command)
+        self.assertNotIn("--opencode-bin", command)
+        self.assertEqual(command[-2:], ["--reviewer", "grok-4-5"])
+
     def test_configuration_supports_one_and_four_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -308,6 +566,25 @@ class RunnerTestCase(unittest.TestCase):
                 reviewers, digest = run_monju.load_reviewer_configuration(config)
                 self.assertEqual(len(reviewers), count)
                 self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_reviewer_selection_uses_requested_order_and_rejects_bad_keys(self) -> None:
+        configured, full_hash = run_monju.load_reviewer_configuration(
+            REPOSITORY / "reviewers.json"
+        )
+        selected, selected_hash = run_monju.select_configured_reviewers(
+            configured,
+            ["qwen3-8-max", "kimi-k3"],
+        )
+        self.assertEqual([item.key for item in selected], ["qwen3-8-max", "kimi-k3"])
+        self.assertEqual([item.ordinal for item in selected], [1, 2])
+        self.assertNotEqual(selected_hash, full_hash)
+        with self.assertRaises(SystemExit):
+            run_monju.select_configured_reviewers(configured, ["missing"])
+        with self.assertRaises(SystemExit):
+            run_monju.select_configured_reviewers(
+                configured,
+                ["kimi-k3", "kimi-k3"],
+            )
 
     def test_configuration_rejects_provider_and_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -367,6 +644,7 @@ class RunnerTestCase(unittest.TestCase):
                     reviewers_file=REPOSITORY / "reviewers.json",
                     timeout_seconds=run_monju.DEFAULT_REVIEWER_TIMEOUT_SECONDS,
                     notify="auto",
+                    reviewer_keys=[],
                 )
                 command = run_monju.tmux_supervisor_command(
                     args,
@@ -426,6 +704,134 @@ class RunnerTestCase(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("PREFLIGHT=ok", result.stdout)
             self.assertIn("REVIEWERS=3", result.stdout)
+
+    def test_preflight_validates_only_selected_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 2)
+            fake = self.make_fake_opencode(root)
+            fake_tmux = self.make_fake_tmux(root)
+            result = self.run_command(
+                home,
+                config,
+                "--preflight",
+                "--reviewer",
+                "reviewer-1",
+                "--workspace",
+                str(workspace),
+                "--opencode-bin",
+                str(fake),
+                "--tmux-bin",
+                str(fake_tmux),
+                env={"FAKE_OPENCODE_DROP_MODEL": "opencode-go/model-2"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("REVIEWERS=1", result.stdout)
+            self.assertIn("REVIEWER_KEYS=reviewer-1", result.stdout)
+
+    def test_dry_run_uses_only_selected_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 3)
+            fake = self.make_fake_opencode(root)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--dry-run",
+                "--reviewer",
+                "reviewer-3",
+                "--reviewer",
+                "reviewer-1",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(fake),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(
+                [item["reviewer"] for item in payload["commands"]],
+                ["Reviewer 3", "Reviewer 1"],
+            )
+
+    def test_manual_handoff_is_private_non_destructive_and_visible_in_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            config = self.write_config(root / "reviewers.json", 1)
+            run_dir, prompt = self.prepare(root, workspace, config)
+            prompt.write_text("# Review\nInspect the supplied files.", encoding="utf-8")
+            result = self.run_command(
+                home,
+                config,
+                "--manual-handoff",
+                "claude-opus",
+                "--manual-display-name",
+                "Claude Opus",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+                "--prompt-file",
+                str(prompt),
+                "--opencode-bin",
+                str(root / "must-not-run-opencode"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("STATUS=manual_handoff_ready", result.stdout)
+            manual_prompt = Path(self.parse_key(result.stdout, "MANUAL_PROMPT_FILE"))
+            response = Path(self.parse_key(result.stdout, "MANUAL_RESPONSE_FILE"))
+            metadata_path = Path(self.parse_key(result.stdout, "MANUAL_HANDOFF_FILE"))
+            for path in (manual_prompt, response, metadata_path):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("<BEGIN_MONJU_REVIEW_BRIEF>", manual_prompt.read_text())
+            self.assertEqual(response.read_text(), "")
+            metadata = json.loads(metadata_path.read_text())
+            self.assertEqual(metadata["display_name"], "Claude Opus")
+            self.assertFalse(metadata["model_verified"])
+
+            response.write_text(REVIEW_TEXT, encoding="utf-8")
+            status = self.run_command(
+                home,
+                config,
+                "--status",
+                "--run-dir",
+                str(run_dir),
+            )
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn("MANUAL_HANDOFFS=1", status.stdout)
+            self.assertIn("MANUAL_RESPONSES_READY=1", status.stdout)
+            self.assertIn(f"MANUAL_RESULT claude-opus: {response}", status.stdout)
+
+            repeated = self.run_command(
+                home,
+                config,
+                "--manual-handoff",
+                "claude-opus",
+                "--workspace",
+                str(workspace),
+                "--run-dir",
+                str(run_dir),
+            )
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertEqual(response.read_text(), REVIEW_TEXT)
 
     def test_preflight_rejects_missing_auth_model_and_variant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -498,7 +904,7 @@ class RunnerTestCase(unittest.TestCase):
             workspace = root / "workspace"
             home.mkdir()
             workspace.mkdir()
-            config = self.write_config(root / "reviewers.json", 1)
+            config = self.write_config(root / "reviewers.json", 2)
             fake_opencode = self.make_fake_opencode(root)
             fake_tmux = self.make_fake_tmux(root)
             run_dir, prompt = self.prepare(root, workspace, config)
@@ -508,6 +914,8 @@ class RunnerTestCase(unittest.TestCase):
                 home,
                 config,
                 "--tmux",
+                "--reviewer",
+                "reviewer-2",
                 "--workspace",
                 str(workspace),
                 "--run-dir",
@@ -541,10 +949,13 @@ class RunnerTestCase(unittest.TestCase):
             self.assertEqual(payload["status"], "success")
             self.assertEqual(payload["execution_mode"], "tmux_supervisor")
             self.assertEqual(payload["tmux_session"], run_dir.name)
+            self.assertEqual(payload["parallel_reviewer_count"], 1)
+            self.assertEqual(payload["reviewers"][0]["key"], "reviewer-2")
             self.assertTrue(
                 (run_dir / f"{run_dir.name}-runner.stdout.log").is_file()
             )
             tmux_argv = (root / "fake-tmux-new-session.json").read_text()
+            self.assertIn('"--reviewer", "reviewer-2"', tmux_argv)
             self.assertNotIn("https://secret.invalid/token", tmux_argv)
             self.assertNotIn("Inspect through tmux", tmux_argv)
 
@@ -1226,6 +1637,10 @@ class RunnerTestCase(unittest.TestCase):
                     str(SCRIPT),
                     "--reviewers-file",
                     str(config),
+                    "--backend",
+                    "opencode",
+                    "--reviewer",
+                    "reviewer-1",
                     "--workspace",
                     str(workspace),
                     "--run-dir",
@@ -1289,6 +1704,10 @@ class RunnerTestCase(unittest.TestCase):
                     str(SCRIPT),
                     "--reviewers-file",
                     str(config),
+                    "--backend",
+                    "opencode",
+                    "--reviewer",
+                    "reviewer-1",
                     "--workspace",
                     str(workspace),
                     "--run-dir",

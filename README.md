@@ -1,10 +1,10 @@
 # Monju
 
-Monju runs the same neutral review through configurable OpenCode Go models in
+Monju runs the same neutral review through explicitly selected Cursor or OpenCode Go models in
 parallel. It publishes private per-model Markdown and a terminal manifest, then
 lets Codex aggregate the reviews in a later conversation turn.
 
-The default reviewers are:
+The configured OpenCode choices are:
 
 | Reviewer | OpenCode Go model | Reasoning variant |
 |---|---|---|
@@ -14,18 +14,36 @@ The default reviewers are:
 | Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
 Grok 4.5 uses `high`, its highest catalogued variant; the other shipped reviewers
-use `max`. Reviewer count, models, and variants are controlled by
-[`reviewers.json`](reviewers.json) rather than fixed in the runner.
+use `max`. The configured Cursor choices are:
 
-> **Usage warning:** A run with the four default reviewers at these highest
+| Reviewer | Cursor CLI model |
+|---|---|
+| Kimi K3 | `kimi-k3-max` |
+| Grok 4.5 | `cursor-grok-4.5-high` |
+| Claude Fable 5 | `claude-fable-5-thinking-max` |
+
+OpenCode models are controlled by [`reviewers.json`](reviewers.json); Cursor
+models and accepted `system/init` identities are controlled by
+[`cursor_reviewers.json`](cursor_reviewers.json).
+
+## Explicit selection is required
+
+Monju never chooses a backend or model by default. Before every launch, the
+calling agent must ask which exact backend/model pairs to use. The CLI enforces
+this with a required `--backend cursor|opencode` and at least one repeated
+`--reviewer KEY`. One run uses one backend; models from both backends require
+separate runs so provenance remains unambiguous.
+
+> **Usage warning:** A run with all four configured OpenCode reviewers at these highest
 > reasoning variants can consume roughly an entire five-hour OpenCode Go usage
 > allowance in one launch. This refers to service allowance, not five hours of
-> elapsed wall-clock time. Reduce the entries in `reviewers.json` when conserving
+> elapsed wall-clock time. Select fewer OpenCode reviewers when conserving
 > allowance matters.
 
 ## Safety model
 
-- Every reviewer receives the same effective prompt through stdin.
+- Every reviewer receives the same effective prompt. OpenCode uses stdin;
+  Cursor uses the final CLI argument and artifacts redact it.
 - OpenCode runs with `--pure`, never `--auto`, and a Monju-specific primary
   agent that denies all tools except read, glob, and grep.
 - `.env` and `.env.*` are denied after the general read allowance;
@@ -34,10 +52,13 @@ use `max`. Reviewer count, models, and variants are controlled by
   subagents through OpenCode permissions. The prompt repeats those constraints.
 - Raw streams stay in owner-only temporary staging until publication.
 - `MONJU_NOTIFY_WEBHOOK_URL` is removed from reviewer environments.
-- No model, variant, or automatic-routing fallback is used.
+- Cursor runs in Ask mode and the reported `system/init` model must match the
+  exact selected model; Fast, Auto, low-effort, and UltraCode-like variants fail.
+- No model, variant, backend, or automatic-routing fallback is used.
 
-Monju can send the brief and target files read by reviewers to OpenCode Go and
-external LLM providers. An explicit Monju invocation authorizes this scoped
+Monju can send the brief and target files read by reviewers to Cursor, OpenCode
+Go, and external LLM providers. An explicit Monju invocation plus an exact
+backend/model selection authorizes this scoped
 read-only workflow but does not override Codex platform approval policy.
 
 ## Requirements
@@ -45,15 +66,16 @@ read-only workflow but does not override Codex platform approval policy.
 - Python 3.11 or later, invoked with `uv`.
 - tmux. Monju uses one exact run-ID-named session as the persistent owner of the
   foreground supervisor.
-- OpenCode CLI. Monju first checks `PATH`, then
-  `~/.opencode/bin/opencode` used by the official installer.
+- At least one review CLI: OpenCode (`opencode`) or Cursor (`agent`).
 - An authenticated OpenCode Go account:
 
   ```bash
   opencode auth login --provider opencode-go
   ```
 
-- Access to each exact model and variant in `reviewers.json`.
+- For Cursor, an authenticated file credential store and explicit Workspace
+  Trust for the reviewed workspace.
+- Access to every exact selected model in the applicable reviewer file.
 - POSIX or WSL2 for the supported process-group behavior. Native Windows is
   best effort.
 
@@ -70,8 +92,8 @@ Install the skill as a symlink for Codex:
 ```
 
 The installer also supports `cursor` and `claude` as *skill hosts*. A Cursor
-installation target does not change the review backend; Monju reviewers still
-run through OpenCode Go.
+installation target does not choose the review backend; each launch still
+requires an explicit Cursor or OpenCode selection.
 
 ```bash
 ./install.sh --list
@@ -82,7 +104,7 @@ run through OpenCode Go.
 
 ## Reviewer configuration
 
-The checked-in configuration has this shape:
+The checked-in OpenCode configuration has this shape:
 
 ```json
 {
@@ -113,6 +135,27 @@ opencode models opencode-go --verbose
 It rejects missing, inactive, or unknown model/variant combinations rather than
 silently lowering quality.
 
+Cursor uses `cursor_reviewers.json`. Each entry has a Cursor CLI `model_id` and
+an `allowed_reported_models` list used to verify the runtime `system/init`
+event. Preflight checks `agent models`; completion also requires an exact runtime
+identity match.
+
+Use repeated `--reviewer KEY` options to select exact models. Keys come from the
+chosen backend's configuration and option order determines artifact order.
+Omission is rejected. Use the same backend and selection for preflight and launch:
+
+```bash
+uv run --script scripts/run_monju.py \
+  --preflight \
+  --backend opencode \
+  --reviewer kimi-k3 \
+  --reviewer qwen3-8-max \
+  --workspace /absolute/path/to/workspace
+```
+
+The selected list is re-numbered and frozen with its SHA-256 in the run
+manifest, so status and recovery do not depend on later config changes.
+
 ## Workflow
 
 ### 1. Preflight
@@ -120,15 +163,17 @@ silently lowering quality.
 ```bash
 uv run --script scripts/run_monju.py \
   --preflight \
+  --backend opencode \
+  --reviewer kimi-k3 \
   --workspace /absolute/path/to/workspace
 ```
 
 Preflight checks:
 
 - tmux executable and access to the user-owned tmux server socket;
-- actual write access to OpenCode data and cache directories;
-- an OpenCode Go credential;
-- every configured model and variant in the current verbose catalog.
+- actual write access to the selected backend's state directories;
+- backend authentication and, for Cursor, Workspace Trust;
+- every explicitly selected model and variant in the backend catalog.
 
 Important results include:
 
@@ -138,15 +183,17 @@ Important results include:
 - `PREFLIGHT=opencode_state_unwritable`: rerun preflight and launch through a
   narrowly scoped outside-sandbox approval.
 - `PREFLIGHT=opencode_auth_required`: complete OpenCode Go login and retry.
-- `PREFLIGHT=reviewer_model_invalid`: correct `reviewers.json`; do not use a
+- `PREFLIGHT=cursor_auth_required`: complete Cursor login and retry.
+- `PREFLIGHT=workspace_trust_required`: run only the printed trust command.
+- `PREFLIGHT=reviewer_model_invalid`: correct the selected backend's config; do not use a
   substitute model.
 
 `TMUX_SERVER=existing` means the current user server will own the run.
 `TMUX_SERVER=absent` is also valid; `--tmux` starts the server with the review
 session.
 
-OpenCode does not use Cursor Workspace Trust. Monju never edits OpenCode
-credentials or configuration automatically.
+Monju never edits backend credentials, Workspace Trust markers, or configuration
+automatically.
 
 ### 2. Prepare and write the brief
 
@@ -167,11 +214,18 @@ excluding `monju-reviews/` from inspection.
 ```bash
 uv run --script scripts/run_monju.py \
   --tmux \
+  --backend opencode \
+  --reviewer kimi-k3 \
+  --backend opencode \
+  --reviewer kimi-k3 \
   --notify auto \
   --workspace /absolute/path/to/workspace \
   --run-dir /absolute/path/to/run \
   --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
+
+Use exactly the same `--backend` and repeated `--reviewer KEY` options as
+preflight.
 
 The runner creates a tmux session whose exact name is the run ID and starts the
 supervisor there without a shell. Do not wrap the command in another tmux
@@ -207,7 +261,8 @@ uv run --script scripts/run_monju.py \
 
 `--status` is read-only and never polls or recovers automatically. For a live
 tmux run it reports `TMUX_SESSION_ALIVE=yes`; for terminal states, read the
-manifest and every generated reviewer Markdown.
+manifest and every generated reviewer Markdown. It also reports the number of
+manual handoffs and lists each non-empty manual response as `MANUAL_RESULT`.
 
 If the manifest is still `running` but the recorded supervisor is gone, status
 returns `stale_running`, preserved staging diagnostics, and:
@@ -228,14 +283,14 @@ uv run --script scripts/run_monju.py \
   --run-dir /absolute/path/to/run
 ```
 
-Each internal worker writes an atomic terminal sidecar after OpenCode exits. It
+Each internal worker writes an atomic terminal sidecar after its backend exits. It
 contains the frozen model/variant, exit state, timing, and SHA-256 plus size for
 the event and stderr artifacts. Recovery verifies those sidecars against the
 schema-v3 running manifest before publishing.
 
-Recovery never invokes OpenCode, contacts an LLM, changes models, or retries.
+Recovery never invokes Cursor or OpenCode, contacts an LLM, changes models, or retries.
 Missing sidecars are `not_ready`. Malformed sidecars or hash mismatches are
-non-publishable `invalid`. A verified OpenCode error can be published as a
+non-publishable `invalid`. A verified backend error can be published as a
 normal partial/failure result when all reviewers completed. If publication or
 the supervisor fails while valid staging survives, the same command can validate
 and retry publication; status does not call such a run published. Genuinely
@@ -252,8 +307,44 @@ explicitly opted in. Monju treats this as an anticipated reviewer failure: it
 keeps DeepSeek configured, records a normal partial/failure result, and continues
 with the other reviews. It does not opt in, retry, or substitute another model.
 
-Schema-v2 Cursor terminal manifests remain readable through `--status`, but old
-Cursor raw streams are intentionally not recoverable by the OpenCode backend.
+New schema-v3 Cursor runs use the same terminal markers and recovery checks as
+OpenCode runs. Legacy schema-v2 Cursor terminal manifests remain readable
+through `--status`, but their raw streams are intentionally not recoverable.
+
+## Manual handoff
+
+For a model available only through a separate subscription or UI, create a
+private copy/paste handoff without invoking OpenCode or any external service:
+
+```bash
+uv run --script scripts/run_monju.py \
+  --manual-handoff claude-opus \
+  --manual-display-name "Claude Opus" \
+  --workspace /absolute/path/to/workspace \
+  --run-dir /absolute/path/to/run \
+  --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
+```
+
+The command creates three owner-only files and prints their paths:
+
+```text
+<run-id>-manual-claude-opus-prompt.md
+<run-id>-manual-claude-opus-response.md
+<run-id>-manual-claude-opus-handoff.json
+```
+
+Give the prompt file to the human operating the external model. They must attach
+or provide only the files required by the review scope, because Monju does not
+package or upload workspace files for manual handoffs. Paste the model's
+unedited answer into the response file. Existing handoff files are never
+overwritten.
+
+Manual responses do not affect the automated manifest, recovery, notification,
+or terminal status. `--status` treats a non-empty response as ready for
+aggregation but does not validate its model identity or contents. During
+aggregation, verify material claims against source and label the response as
+manually supplied and unverified. A missing manual answer is not an automated
+reviewer failure.
 
 ## Process ownership and artifacts
 
@@ -324,30 +415,35 @@ solution.
 ## CLI summary
 
 ```text
---preflight             Check state, authentication, models, and variants
+--preflight             Check tmux, backend state, auth, and selected models
 --prepare               Create a unique run directory and empty brief
 --tmux                  Launch the supervisor in a tracked tmux session
+--backend NAME          Required launch backend: cursor or opencode
 --tmux-bin PATH         tmux executable
 --background            Rejected; use --tmux
 --status                Read status without waiting
 --recover               Validate and publish completed preserved artifacts
 --run-dir PATH          Prepared run directory
 --opencode-bin PATH     OpenCode executable
---reviewers-file PATH   Reviewer JSON configuration
+--agent-bin PATH        Cursor executable
+--reviewers-file PATH   Backend reviewer JSON configuration
+--reviewer KEY          Select exact configured model; repeat; required
+--manual-handoff KEY    Create private manual prompt/response files
+--manual-display-name   Human-readable manual reviewer name
 --timeout-seconds N     Per-reviewer timeout; default 7200
 --notify MODE           none, auto, desktop, or webhook
---dry-run               Print commands without invoking OpenCode
+--dry-run               Print commands without invoking a model
 ```
 
 ---
 
 # 日本語
 
-Monjuは、同じneutral briefを設定済みのOpenCode Goモデルへ並列送信し、各レビューと
+Monjuは、同じneutral briefを明示的に選択したCursorまたはOpenCode Goモデルへ並列送信し、各レビューと
 終端manifestを非公開成果物として保存し、別の会話ターンでCodexが結果を集約できる
 ようにします。
 
-既定のレビュアーは次の4件です。
+OpenCodeで選択できるレビュアーは次の4件です。
 
 | レビュアー | OpenCode Goモデル | 推論variant |
 |---|---|---|
@@ -357,17 +453,27 @@ Monjuは、同じneutral briefを設定済みのOpenCode Goモデルへ並列送
 | Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
 Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの既定レビュアーは
-`max`を使います。レビュアー数、モデル、variantはrunnerには固定せず、
-[`reviewers.json`](reviewers.json)で管理します。
+`max`を使います。Cursorでは`kimi-k3-max`、`cursor-grok-4.5-high`、
+`claude-fable-5-thinking-max`を選択できます。OpenCodeは
+[`reviewers.json`](reviewers.json)、Cursorは
+[`cursor_reviewers.json`](cursor_reviewers.json)で管理します。
+
+## 経路とモデルは毎回明示
+
+Monjuはbackendやモデルを既定選択しません。起動前に、どのモデルをCursorと
+OpenCodeのどちら経由で使うか、正確な組み合わせをユーザーへ確認します。CLIでも
+`--backend cursor|opencode`と1件以上の`--reviewer KEY`が必須です。1つのrunでは
+1つのbackendだけを使い、両方を使う場合はprovenanceを分けた2つのrunにします。
 
 > **利用量の注意:** 既定の4レビュアーを上記の最高推論variantで動かすと、OpenCode
 > Goの5時間利用枠を1回の実行でほぼ使い切る可能性があります。レビューの実時間が
-> 5時間という意味ではありません。利用枠を節約したい場合は、実行前に
-> `reviewers.json`のレビュアー数を減らしてください。
+> 5時間という意味ではありません。利用枠を節約したい場合は、選択するOpenCode
+> レビュアーを減らしてください。
 
 ## 安全性
 
-- 全レビュアーにstdin経由で同じ実効promptを渡します。
+- 全レビュアーに同じ実効promptを渡します。OpenCodeはstdin、Cursorは最後のCLI引数を
+  使い、成果物ではその引数をredactします。
 - OpenCodeは`--pure`で実行し、`--auto`は使いません。Monju専用agentは既定ですべての
   toolを拒否し、read、glob、grepだけを許可します。
 - 通常ファイルのreadを許可した後で`.env`と`.env.*`を明示的に拒否し、
@@ -376,9 +482,11 @@ Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの�
   promptでも同じ制約を伝えます。
 - raw streamは公開までowner-onlyの一時stagingへ保持します。
 - レビュアー環境から`MONJU_NOTIFY_WEBHOOK_URL`を除去します。
-- モデル、variant、自動routingの代替は行いません。
+- Cursorの`system/init`モデルを正確に照合し、Fast、Auto、low-effort、UltraCode系は
+  failureにします。
+- モデル、variant、backend、自動routingの代替は行いません。
 
-Monjuはbriefと、レビュアーが読む対象ファイルの内容をOpenCode Goや外部LLM
+Monjuはbriefと、レビュアーが読む対象ファイルの内容をCursor、OpenCode Goや外部LLM
 サービスへ送信することがあります。明示的なMonju呼び出しは、この範囲のread-only
 処理を承認しますが、Codex platform側のapproval policyを上書きしません。
 
@@ -386,15 +494,15 @@ Monjuはbriefと、レビュアーが読む対象ファイルの内容をOpenCod
 
 - Python 3.11以降。Pythonの実行には`uv`を使います。
 - tmux。run IDと同名のsessionがforeground supervisorを永続的に所有します。
-- OpenCode CLI。まず`PATH`を確認し、見つからなければ公式installerの
-  `~/.opencode/bin/opencode`を使います。
+- OpenCode CLI (`opencode`)またはCursor CLI (`agent`)の少なくとも一方。
 - 認証済みのOpenCode Goアカウント：
 
   ```bash
   opencode auth login --provider opencode-go
   ```
 
-- `reviewers.json`に記載した各モデルとvariantの利用権。
+- Cursorではfile credential storeによる認証と対象workspaceのWorkspace Trust。
+- 選択したbackendの設定に記載した正確なモデルの利用権。
 - process group制御を利用できるPOSIX環境またはWSL2。native Windowsはbest effortです。
 
 OpenCodeはversion確認やmodel一覧取得だけでも`~/.local/share/opencode`と
@@ -409,8 +517,8 @@ Codexからskillとして使う場合は、シンボリックリンクでイン�
 ./install.sh --agent codex
 ```
 
-installerはskill hostとして`cursor`と`claude`にも対応しています。Cursor向けに
-インストールしてもreview backendは変わらず、レビュアーはOpenCode Go経由で動きます。
+installerはskill hostとして`cursor`と`claude`にも対応しています。skill hostは
+review backendを決めません。起動ごとにCursorまたはOpenCodeを明示します。
 
 ```bash
 ./install.sh --list
@@ -421,7 +529,7 @@ installerはskill hostとして`cursor`と`claude`にも対応しています。
 
 ## レビュアー設定
 
-同梱する設定は次の形式です。
+OpenCode用の設定は次の形式です。
 
 ```json
 {
@@ -451,6 +559,26 @@ opencode models opencode-go --verbose
 
 存在しない、無効、または未知のモデルとvariantは拒否し、品質を自動的に下げません。
 
+Cursorは`cursor_reviewers.json`を使います。各entryの`model_id`をCLIへ渡し、
+`allowed_reported_models`で実行時の`system/init` identityを検証します。preflightでは
+`agent models`も確認します。
+
+`--reviewer KEY`を繰り返して正確なモデルを選択します。KEYは選んだbackendの設定にある
+値です。指定順が成果物の順番になり、省略は拒否されます。preflightと起動には同じ
+backendと選択を渡してください。
+
+```bash
+uv run --script scripts/run_monju.py \
+  --preflight \
+  --backend opencode \
+  --reviewer kimi-k3 \
+  --reviewer qwen3-8-max \
+  --workspace /absolute/path/to/workspace
+```
+
+選択した一覧は連番を振り直し、SHA-256とともにrun manifestへ固定します。その後に
+設定ファイルを変更しても、statusとrecoverの対象は変わりません。
+
 ## 実行手順
 
 ### 1. Preflight
@@ -458,15 +586,17 @@ opencode models opencode-go --verbose
 ```bash
 uv run --script scripts/run_monju.py \
   --preflight \
+  --backend opencode \
+  --reviewer kimi-k3 \
   --workspace /absolute/path/to/workspace
 ```
 
 preflightでは次を確認します。
 
 - tmux executableとuser-owned tmux server socketへのaccess
-- OpenCode data/cache directoryへの実際の書き込み可否
-- OpenCode Go credential
-- 現在のverbose catalogにある全設定モデルとvariant
+- 選択したbackendのstate directoryへの実際の書き込み可否
+- backend認証と、Cursorの場合はWorkspace Trust
+- backend catalogにある明示選択済みモデルとvariant
 
 主な結果は次のとおりです。
 
@@ -474,13 +604,14 @@ preflightでは次を確認します。
 - `PREFLIGHT=tmux_state_unwritable`: preflightとlaunchを同じsandbox外approvalで再実行
 - `PREFLIGHT=opencode_state_unwritable`: 対象を限定したsandbox外approvalで再実行
 - `PREFLIGHT=opencode_auth_required`: OpenCode Goへloginしてから再実行
-- `PREFLIGHT=reviewer_model_invalid`: `reviewers.json`を修正し、代替モデルは使わない
+- `PREFLIGHT=cursor_auth_required`: Cursorへloginしてから再実行
+- `PREFLIGHT=workspace_trust_required`: 表示されたtrust commandだけを実行
+- `PREFLIGHT=reviewer_model_invalid`: 選択backendの設定を修正し、代替モデルは使わない
 
 `TMUX_SERVER=existing`は既存のuser tmux serverがrunを所有することを示します。
 `TMUX_SERVER=absent`も正常であり、`--tmux`がreview sessionとともにserverを起動します。
 
-OpenCodeはCursor Workspace Trustを使いません。MonjuはOpenCodeのcredentialや設定を
-自動編集しません。
+Monjuはbackendのcredential、Workspace Trust marker、設定を自動編集しません。
 
 ### 2. Run directoryとbriefの準備
 
@@ -505,6 +636,8 @@ uv run --script scripts/run_monju.py \
   --run-dir /absolute/path/to/run \
   --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
+
+preflightとまったく同じ`--backend`と`--reviewer KEY`をこの起動commandにも渡します。
 
 runnerはrun IDと同名のtmux sessionを作り、shellを介さずにsupervisorをforeground
 commandとして起動します。commandを別のtmuxで包んだり、`&`、`nohup`、`setsid`、
@@ -538,7 +671,8 @@ uv run --script scripts/run_monju.py \
 
 `--status`はread-onlyであり、自動pollingや自動recoverを行いません。生存中のtmux run
 では`TMUX_SESSION_ALIVE=yes`を返します。終端状態ならmanifestと生成済みの全review
-Markdownを読みます。
+Markdownを読みます。手動handoffの件数も表示し、回答が入ったファイルは
+`MANUAL_RESULT`として列挙します。
 
 manifestが`running`のままsupervisorが消失した場合は、`stale_running`とstagingの
 診断情報に加えて次を返します。
@@ -565,7 +699,7 @@ schema-v3 running manifestと照合します。
 
 recoverはOpenCodeや外部LLMを呼ばず、モデル変更やretryも行いません。sidecar不足は
 `not_ready`、破損やhash不一致は公開不能な`invalid`です。全レビュアーが完了していれば、
-検証済みOpenCode errorを通常のpartial/failureとして公開できます。publicationまたは
+検証済みbackend errorを通常のpartial/failureとして公開できます。publicationまたは
 supervisorだけが失敗し、有効なstagingが残っている場合は、同じ検証を通して公開を
 再試行できます。すでに終端manifestが公開済みなら、再recoverはread-onlyのno-opです。
 
@@ -577,8 +711,41 @@ HTTP 403 `RegionError`を返すことがあります。これは想定内のrevi
 記録し、DeepSeekを設定から外さず、ほかの結果を集約します。自動opt-in、retry、
 代替モデルへの切り替えは行わず、runは通常どおりpartial/failure扱いです。
 
-schema-v2のCursor終端manifestは`--status`で引き続き読めますが、旧Cursor raw streamは
-OpenCode backendからrecoverできません。
+新しいschema-v3のCursor runはOpenCodeと同じterminal markerとrecovery検証を使います。
+旧schema-v2のCursor終端manifestは`--status`で引き続き読めますが、そのraw streamは
+recoverできません。
+
+## 手動handoff
+
+別契約のWeb UIなどからしか使えないモデルには、OpenCodeや外部サービスを起動せず、
+人が受け渡すためのファイルを作れます。
+
+```bash
+uv run --script scripts/run_monju.py \
+  --manual-handoff claude-opus \
+  --manual-display-name "Claude Opus" \
+  --workspace /absolute/path/to/workspace \
+  --run-dir /absolute/path/to/run \
+  --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
+```
+
+owner-onlyのファイルを3つ作り、その場所を表示します。
+
+```text
+<run-id>-manual-claude-opus-prompt.md
+<run-id>-manual-claude-opus-response.md
+<run-id>-manual-claude-opus-handoff.json
+```
+
+外部モデルを操作する人へpromptファイルを渡してください。手動handoffではworkspaceを
+自動でまとめたりuploadしたりしません。review範囲に必要なファイルだけを人が別途添付し、
+モデルの回答を編集せずresponseファイルへ貼り付けます。既存のhandoffファイルは
+上書きしません。
+
+手動回答は自動実行のmanifest、recover、通知、終端statusには影響しません。
+`--status`は空でないresponseを集約可能として列挙しますが、モデル名や回答内容までは
+検証しません。集約時に重要な指摘をsourceと照合し、手動提供かつ未検証の回答であることを
+明記してください。回答が未提出でも、自動レビュアーのfailureには数えません。
 
 ## プロセスの所有関係と成果物
 
@@ -647,17 +814,22 @@ sandbox_mode = "workspace-write"
 ## CLI一覧
 
 ```text
---preflight             状態領域、認証、model、variantを確認
+--preflight             tmux、backend状態、認証、選択modelを確認
 --prepare               一意なrun directoryと空のbriefを作成
 --tmux                  追跡可能なtmux sessionでsupervisorを起動
+--backend NAME          必須の起動backend: cursorまたはopencode
 --tmux-bin PATH         tmux executable
 --background            拒否される旧option。--tmuxを使用
 --status                待機せず現在状態を読み取り
 --recover               完了済みの保存artifactを検証・公開
 --run-dir PATH          prepare済みrun directory
 --opencode-bin PATH     OpenCode executable
---reviewers-file PATH   レビュアーJSON設定
+--agent-bin PATH        Cursor executable
+--reviewers-file PATH   backend別レビュアーJSON設定
+--reviewer KEY          正確な設定modelを選択。複数指定可。必須
+--manual-handoff KEY    手動用の非公開promptとresponseを作成
+--manual-display-name   手動レビュアーの表示名
 --timeout-seconds N     レビュアーごとのtimeout。既定7200秒
 --notify MODE           none、auto、desktop、webhook
---dry-run               OpenCodeを起動せずcommandを表示
+--dry-run               modelを起動せずcommandを表示
 ```

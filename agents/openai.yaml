@@ -1,4 +1,4 @@
 interface:
   display_name: "Monju"
-  short_description: "Launch persistent OpenCode Go reviews"
-  default_prompt: "Use $monju to launch parallel read-only OpenCode Go reviews in a tracked tmux session, notify me when they finish, and collect the results in a later turn."
+  short_description: "Run selected Cursor, OpenCode, or manual reviews"
+  default_prompt: "Use $monju. First ask me which exact backend/model pairs to use; never choose defaults. Then launch the selected parallel read-only Cursor or OpenCode reviews in tracked tmux sessions, support manual handoffs for non-CLI models, and collect the results in a later turn."

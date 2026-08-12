@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "provider": "cursor",
+  "reviewers": [
+    {
+      "key": "kimi-k3",
+      "display_name": "Kimi K3",
+      "model_id": "kimi-k3-max",
+      "allowed_reported_models": [
+        "kimi-k3-max",
+        "Kimi K3 Max"
+      ]
+    },
+    {
+      "key": "grok-4-5",
+      "display_name": "Grok 4.5",
+      "model_id": "cursor-grok-4.5-high",
+      "allowed_reported_models": [
+        "cursor-grok-4.5-high",
+        "Cursor Grok 4.5 High"
+      ]
+    },
+    {
+      "key": "fable-5",
+      "display_name": "Claude Fable 5",
+      "model_id": "claude-fable-5-thinking-max",
+      "allowed_reported_models": [
+        "claude-fable-5-thinking-max",
+        "Fable 5 300K Max"
+      ]
+    }
+  ]
+}
