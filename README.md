@@ -10,16 +10,18 @@ The configured OpenCode choices are:
 |---|---|---|
 | Kimi K3 | `opencode-go/kimi-k3` | `max` |
 | Grok 4.5 | `opencode-go/grok-4.5` | `high` |
+| DeepSeek V4 Pro (0813) | `opencode-go/deepseek-v4-pro` | `max` |
 | DeepSeek V4 Flash | `opencode-go/deepseek-v4-flash` | `max` |
 | Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
 Grok 4.5 uses `high`, its highest catalogued variant; the other shipped reviewers
-use `max`. The configured Cursor choices are:
+use `max`. Cursor Grok 4.6 uses the highest `xhigh` effort without the Fast speed
+tier. The configured Cursor choices are:
 
 | Reviewer | Cursor CLI model |
 |---|---|
 | Kimi K3 | `kimi-k3-max` |
-| Grok 4.5 | `cursor-grok-4.5-high` |
+| Grok 4.6 | `cursor-grok-4.6-xhigh` |
 | Claude Fable 5 | `claude-fable-5-thinking-max` |
 
 OpenCode models are controlled by [`reviewers.json`](reviewers.json); Cursor
@@ -34,7 +36,7 @@ this with a required `--backend cursor|opencode` and at least one repeated
 `--reviewer KEY`. One run uses one backend; models from both backends require
 separate runs so provenance remains unambiguous.
 
-> **Usage warning:** A run with all four configured OpenCode reviewers at these highest
+> **Usage warning:** A run with all five configured OpenCode reviewers at these highest
 > reasoning variants can consume roughly an entire five-hour OpenCode Go usage
 > allowance in one launch. This refers to service allowance, not five hours of
 > elapsed wall-clock time. Select fewer OpenCode reviewers when conserving
@@ -301,11 +303,12 @@ result must contain all sections required by the shared review prompt, preventin
 progress messages such as "I will inspect the files" from becoming a successful
 empty review.
 
-DeepSeek V4 Flash may return a non-retryable HTTP 403 `RegionError` when its
-latest version is hosted only in China and the OpenCode workspace has not
+DeepSeek V4 Pro or Flash may return a non-retryable HTTP 403 `RegionError` when
+the selected version is hosted only in China and the OpenCode workspace has not
 explicitly opted in. Monju treats this as an anticipated reviewer failure: it
-keeps DeepSeek configured, records a normal partial/failure result, and continues
-with the other reviews. It does not opt in, retry, or substitute another model.
+keeps the selected DeepSeek reviewer configured, records a normal partial/failure
+result, and continues with the other reviews. It does not opt in, retry, or
+substitute another model.
 
 New schema-v3 Cursor runs use the same terminal markers and recovery checks as
 OpenCode runs. Legacy schema-v2 Cursor terminal manifests remain readable
@@ -443,18 +446,20 @@ Monjuは、同じneutral briefを明示的に選択したCursorまたはOpenCode
 終端manifestを非公開成果物として保存し、別の会話ターンでCodexが結果を集約できる
 ようにします。
 
-OpenCodeで選択できるレビュアーは次の4件です。
+OpenCodeで選択できるレビュアーは次の5件です。
 
 | レビュアー | OpenCode Goモデル | 推論variant |
 |---|---|---|
 | Kimi K3 | `opencode-go/kimi-k3` | `max` |
 | Grok 4.5 | `opencode-go/grok-4.5` | `high` |
+| DeepSeek V4 Pro (0813) | `opencode-go/deepseek-v4-pro` | `max` |
 | DeepSeek V4 Flash | `opencode-go/deepseek-v4-flash` | `max` |
 | Qwen3.8 Max | `opencode-go/qwen3.8-max` | `max` |
 
 Grok 4.5はcatalog上の最高variantである`high`を使い、そのほかの既定レビュアーは
-`max`を使います。Cursorでは`kimi-k3-max`、`cursor-grok-4.5-high`、
-`claude-fable-5-thinking-max`を選択できます。OpenCodeは
+`max`を使います。CursorのGrok 4.6はFastではない最高effortの`xhigh`を使います。
+Cursorでは`kimi-k3-max`、`cursor-grok-4.6-xhigh`、`claude-fable-5-thinking-max`を
+選択できます。OpenCodeは
 [`reviewers.json`](reviewers.json)、Cursorは
 [`cursor_reviewers.json`](cursor_reviewers.json)で管理します。
 
@@ -465,7 +470,7 @@ OpenCodeのどちら経由で使うか、正確な組み合わせをユーザー
 `--backend cursor|opencode`と1件以上の`--reviewer KEY`が必須です。1つのrunでは
 1つのbackendだけを使い、両方を使う場合はprovenanceを分けた2つのrunにします。
 
-> **利用量の注意:** 既定の4レビュアーを上記の最高推論variantで動かすと、OpenCode
+> **利用量の注意:** 既定の5レビュアーを上記の最高推論variantで動かすと、OpenCode
 > Goの5時間利用枠を1回の実行でほぼ使い切る可能性があります。レビューの実時間が
 > 5時間という意味ではありません。利用枠を節約したい場合は、選択するOpenCode
 > レビュアーを減らしてください。
@@ -706,10 +711,11 @@ supervisorだけが失敗し、有効なstagingが残っている場合は、同
 exit code 0でtextが存在するだけではreview成功にしません。共通promptで要求した全
 sectionが揃わない進捗文だけの出力はreviewer failureとして扱います。
 
-DeepSeek V4 Flashは、中国ホスティングへの明示的opt-inがない場合、再試行不能な
-HTTP 403 `RegionError`を返すことがあります。これは想定内のreviewer failureとして
-記録し、DeepSeekを設定から外さず、ほかの結果を集約します。自動opt-in、retry、
-代替モデルへの切り替えは行わず、runは通常どおりpartial/failure扱いです。
+DeepSeek V4 ProまたはFlashは、選択されたversionが中国だけでホストされ、明示的な
+opt-inがない場合、再試行不能なHTTP 403 `RegionError`を返すことがあります。これは
+想定内のreviewer failureとして記録し、選択されたDeepSeek reviewerを設定から外さず、
+ほかの結果を集約します。自動opt-in、retry、代替モデルへの切り替えは行わず、runは
+通常どおりpartial/failure扱いです。
 
 新しいschema-v3のCursor runはOpenCodeと同じterminal markerとrecovery検証を使います。
 旧schema-v2のCursor終端manifestは`--status`で引き続き読めますが、そのraw streamは

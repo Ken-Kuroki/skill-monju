@@ -12,12 +12,12 @@
       ]
     },
     {
-      "key": "grok-4-5",
-      "display_name": "Grok 4.5",
-      "model_id": "cursor-grok-4.5-high",
+      "key": "grok-4-6",
+      "display_name": "Grok 4.6",
+      "model_id": "cursor-grok-4.6-xhigh",
       "allowed_reported_models": [
-        "cursor-grok-4.5-high",
-        "Cursor Grok 4.5 High"
+        "cursor-grok-4.6-xhigh",
+        "Cursor Grok 4.6 Extra High"
       ]
     },
     {

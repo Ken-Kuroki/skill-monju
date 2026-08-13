@@ -38,7 +38,7 @@ information or complete backend authentication or Cursor Workspace Trust.
 
 ## Launch turn
 
-Treat a four-reviewer OpenCode run at the shipped highest reasoning variants as
+Treat a five-reviewer OpenCode run at the shipped highest reasoning variants as
 likely to consume roughly an entire five-hour OpenCode Go usage allowance in a
 single launch. Tell the user this before launching when it is not already clear,
 but do not turn the warning into an extra confirmation step. Reduce the entries
@@ -239,12 +239,12 @@ untrusted external destination:
    and artifact hashes. It can retry publication after `artifact_failure` or
    `supervisor_failure` only when the same validation succeeds. A genuinely
    published terminal manifest makes repeated recovery a read-only no-op.
-   Treat DeepSeek V4 Flash's non-retryable HTTP 403 `RegionError` saying that
-   the latest model is hosted only in China and requires explicit opt-in as an
-   expected reviewer failure. Keep the reviewer configured, report the failure,
-   and aggregate the other results. Do not opt in, retry, or substitute a model
-   automatically. Expected here means operationally anticipated, not successful;
-   the run remains a normal partial/failure result.
+   Treat a non-retryable HTTP 403 `RegionError` from DeepSeek V4 Pro or Flash
+   saying that the latest model is hosted only in China and requires explicit
+   opt-in as an expected reviewer failure. Keep the reviewer configured, report
+   the failure, and aggregate the other results. Do not opt in, retry, or
+   substitute a model automatically. Expected here means operationally
+   anticipated, not successful; the run remains a normal partial/failure result.
 4. For terminal status, read the manifest and all generated review Markdown.
    Also read each non-empty `MANUAL_RESULT` reported by status, while keeping its
    unverified manual provenance distinct from automated results.
@@ -276,15 +276,16 @@ exact `variant`; Cursor entries carry the exact allowed names accepted from the
 CLI's `system/init` event. The shipped configurations use:
 
 ```text
-Kimi K3:          opencode-go/kimi-k3 / max
-Grok 4.5:         opencode-go/grok-4.5 / high
-DeepSeek V4 Flash: opencode-go/deepseek-v4-flash / max
-Qwen3.8 Max:      opencode-go/qwen3.8-max / max
+Kimi K3:                opencode-go/kimi-k3 / max
+Grok 4.5:               opencode-go/grok-4.5 / high
+DeepSeek V4 Pro (0813): opencode-go/deepseek-v4-pro / max
+DeepSeek V4 Flash:      opencode-go/deepseek-v4-flash / max
+Qwen3.8 Max:            opencode-go/qwen3.8-max / max
 
 Cursor:
-Kimi K3:          kimi-k3-max
-Grok 4.5:         cursor-grok-4.5-high
-Claude Fable 5:  claude-fable-5-thinking-max
+Kimi K3:         kimi-k3-max
+Grok 4.6:        cursor-grok-4.6-xhigh
+Claude Fable 5: claude-fable-5-thinking-max
 ```
 
 The count is configurable rather than fixed in the runner. OpenCode preflight
@@ -293,6 +294,7 @@ verifies every selected model and variant against
 and runtime verification checks the exact `system/init` identity. The highest
 OpenCode variant is model-specific: Grok 4.5 uses `high`, while the other shipped
 reviewers use `max`; do not assume every model uses the literal variant `max`.
+Cursor Grok 4.6 uses the highest `xhigh` effort without the Fast speed tier.
 Repeated `--reviewer KEY` options explicitly select and order models for one run.
 At least one is required. The
 runner reassigns ordinals and freezes that selected list and its hash in the

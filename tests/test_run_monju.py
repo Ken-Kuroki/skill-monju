@@ -197,7 +197,7 @@ class RunnerTestCase(unittest.TestCase):
                     raise SystemExit(0)
                 if args == ["models"]:
                     print("kimi-k3-max")
-                    print("cursor-grok-4.5-high")
+                    print("cursor-grok-4.6-xhigh")
                     print("claude-fable-5-thinking-max")
                     raise SystemExit(0)
                 if "--mode=ask" not in args or "--output-format" not in args:
@@ -213,7 +213,7 @@ class RunnerTestCase(unittest.TestCase):
                     raise SystemExit(69)
                 reported = {{
                     "kimi-k3-max": "Kimi K3 Max",
-                    "cursor-grok-4.5-high": "Cursor Grok 4.5 High",
+                    "cursor-grok-4.6-xhigh": "Cursor Grok 4.6 Extra High",
                     "claude-fable-5-thinking-max": "Fable 5 300K Max",
                 }}[model]
                 print(json.dumps({{
@@ -361,6 +361,7 @@ class RunnerTestCase(unittest.TestCase):
             [
                 ("opencode-go/kimi-k3", "max"),
                 ("opencode-go/grok-4.5", "high"),
+                ("opencode-go/deepseek-v4-pro", "max"),
                 ("opencode-go/deepseek-v4-flash", "max"),
                 ("opencode-go/qwen3.8-max", "max"),
             ],
@@ -534,7 +535,7 @@ class RunnerTestCase(unittest.TestCase):
         )
         reviewers, config_hash = run_monju.select_configured_reviewers(
             configured,
-            ["grok-4-5"],
+            ["grok-4-6"],
         )
         run_monju.configure_reviewers(reviewers, config_hash)
         run_dir = Path("/tmp/monju-cursor-tmux-test")
@@ -542,7 +543,7 @@ class RunnerTestCase(unittest.TestCase):
             reviewers_file=REPOSITORY / "cursor_reviewers.json",
             timeout_seconds=run_monju.DEFAULT_REVIEWER_TIMEOUT_SECONDS,
             notify="none",
-            reviewer_keys=["grok-4-5"],
+            reviewer_keys=["grok-4-6"],
         )
         command = run_monju.tmux_supervisor_command(
             args,
@@ -556,7 +557,7 @@ class RunnerTestCase(unittest.TestCase):
         self.assertIn("cursor", command)
         self.assertIn("--agent-bin", command)
         self.assertNotIn("--opencode-bin", command)
-        self.assertEqual(command[-2:], ["--reviewer", "grok-4-5"])
+        self.assertEqual(command[-2:], ["--reviewer", "grok-4-6"])
 
     def test_configuration_supports_one_and_four_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1077,47 +1078,53 @@ class RunnerTestCase(unittest.TestCase):
             manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
             self.assertEqual(manifest["status"], "partial_failure")
 
-    def test_deepseek_region_error_is_an_expected_partial_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            home = root / "home"
-            workspace = root / "workspace"
-            home.mkdir()
-            workspace.mkdir()
-            config = REPOSITORY / "reviewers.json"
-            fake = self.make_fake_opencode(root)
-            run_dir, prompt = self.prepare(root, workspace, config)
-            prompt.write_text("# Review\nInspect.", encoding="utf-8")
-            result = self.run_command(
-                home,
-                config,
-                "--workspace",
-                str(workspace),
-                "--run-dir",
-                str(run_dir),
-                "--prompt-file",
-                str(prompt),
-                "--opencode-bin",
-                str(fake),
-                env={
-                    "FAKE_OPENCODE_REGION_ERROR_MODEL":
-                        "opencode-go/deepseek-v4-flash"
-                },
-            )
-            self.assertEqual(result.returncode, 3, result.stderr)
-            manifest = json.loads((run_dir / f"{run_dir.name}-manifest.json").read_text())
-            self.assertEqual(manifest["status"], "partial_failure")
-            deepseek = next(
-                item
-                for item in manifest["results"]
-                if item["requested_model"] == "opencode-go/deepseek-v4-flash"
-            )
-            self.assertEqual(deepseek["status"], "failed")
-            self.assertIn("only available hosted in China", deepseek["error"])
-            self.assertEqual(
-                sum(item["status"] == "success" for item in manifest["results"]),
-                3,
-            )
+    def test_deepseek_region_error_is_expected_for_pro_and_flash(self) -> None:
+        for model_id in (
+            "opencode-go/deepseek-v4-pro",
+            "opencode-go/deepseek-v4-flash",
+        ):
+            with (
+                self.subTest(model_id=model_id),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                home = root / "home"
+                workspace = root / "workspace"
+                home.mkdir()
+                workspace.mkdir()
+                config = REPOSITORY / "reviewers.json"
+                fake = self.make_fake_opencode(root)
+                run_dir, prompt = self.prepare(root, workspace, config)
+                prompt.write_text("# Review\nInspect.", encoding="utf-8")
+                result = self.run_command(
+                    home,
+                    config,
+                    "--workspace",
+                    str(workspace),
+                    "--run-dir",
+                    str(run_dir),
+                    "--prompt-file",
+                    str(prompt),
+                    "--opencode-bin",
+                    str(fake),
+                    env={"FAKE_OPENCODE_REGION_ERROR_MODEL": model_id},
+                )
+                self.assertEqual(result.returncode, 3, result.stderr)
+                manifest = json.loads(
+                    (run_dir / f"{run_dir.name}-manifest.json").read_text()
+                )
+                self.assertEqual(manifest["status"], "partial_failure")
+                deepseek = next(
+                    item
+                    for item in manifest["results"]
+                    if item["requested_model"] == model_id
+                )
+                self.assertEqual(deepseek["status"], "failed")
+                self.assertIn("only available hosted in China", deepseek["error"])
+                self.assertEqual(
+                    sum(item["status"] == "success" for item in manifest["results"]),
+                    4,
+                )
 
     def test_reviewer_timeout_is_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

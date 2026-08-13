@@ -15,6 +15,12 @@
       "variant": "high"
     },
     {
+      "key": "deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro (0813)",
+      "model_id": "opencode-go/deepseek-v4-pro",
+      "variant": "max"
+    },
+    {
       "key": "deepseek-v4-flash",
       "display_name": "DeepSeek V4 Flash",
       "model_id": "opencode-go/deepseek-v4-flash",
