@@ -5,9 +5,10 @@ description: Launch explicitly selected independent, parallel, read-only Cursor 
 
 # Monju
 
-Give one neutral brief to every explicitly selected reviewer. Run the
-foreground supervisor inside a run-ID-named tmux session, end the launch turn
-after startup, and inspect results only in a later turn.
+Give one neutral brief to every explicitly selected reviewer. Batch all selected
+reviewers for the same backend into one run-ID-named tmux session, finish
+starting every requested backend batch before ending the launch turn, and
+inspect results only in a later turn.
 
 ## Authorization
 
@@ -27,10 +28,15 @@ contains every exact pair, restate the selection and continue without asking
 again. A reviewer key alone is insufficient in conversation unless it is shown
 together with its exact model ID and variant.
 
-One automated run uses exactly one backend. If the user wants models from both
-backends, create and launch one prepared run per backend and keep their artifacts
-and provenance separate. Never substitute the same-named model through the other
-backend.
+The backend boundary applies to a run, not to a model or conversation turn. One
+automated run uses exactly one backend and may contain any number of explicitly
+selected models from that backend. For each selected backend, batch all of its
+models into exactly one prepared run, one run directory, and one tmux session by
+repeating `--reviewer KEY`. Never call `--prepare` or create a run directory or
+tmux session once per model. If the user wants models from both backends, create
+and launch exactly one prepared run per backend in the same launch turn and keep
+their artifacts and provenance separate. Never substitute the same-named model
+through the other backend.
 
 When filesystem escalation is needed, submit the tool call immediately with a
 precise platform approval request. Stop only when the user must supply missing
@@ -47,21 +53,33 @@ repeated `--reviewer KEY` option and never defaults to all reviewers. Use keys
 from the chosen backend's configuration, preserve the user's option order, and
 pass the same `--backend` and reviewer selection to preflight and launch.
 
+Before running commands, partition the selected backend/model pairs by backend.
+Each partition is one backend batch. Multiple models in one partition must stay
+together through preflight, prepare, and launch; repeated `--reviewer` options
+start their internal workers in parallel inside the batch's single supervisor
+and tmux session. The instruction to end the turn after startup means after all
+requested backend batches have started; it is not a one-backend-per-turn or
+one-model-per-run restriction.
+
 1. Identify the workspace and exact review scope. Read enough source material to
    write a self-contained neutral brief without including Codex's conclusions.
 2. Resolve this skill directory as `<monju-skill-dir>` and use
-   `<absolute-workspace>/monju-reviews` as the default output root.
-3. Run preflight before creating a run:
+   `<absolute-workspace>/monju-reviews` as the default output root for every
+   backend batch.
+3. Run preflight for each backend batch before creating its run. Include every
+   selected model from that backend in the same command:
 
    ```bash
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
      --preflight \
      --backend <cursor-or-opencode> \
-     --reviewer <configured-key> \
+     --reviewer <first-configured-key> \
+     --reviewer <second-configured-key> \
      --workspace "<absolute-workspace>"
    ```
 
-   Append one `--reviewer <configured-key>` per selected model. For Cursor, the
+   Append one `--reviewer <configured-key>` per selected model; one is the
+   minimum, not the maximum. For Cursor, the
    default configuration is `cursor_reviewers.json`; for OpenCode it is
    `reviewers.json`. Repeat the exact backend and reviewer options on launch.
 
@@ -95,7 +113,8 @@ pass the same `--backend` and reviewer selection to preflight and launch.
    - Treat missing models or variants as configuration failures. Never substitute
      a model, lower reasoning effort, use automatic routing, or retry indefinitely.
 
-5. Prepare a unique run directory after `PREFLIGHT=ok`:
+5. After `PREFLIGHT=ok`, prepare exactly one unique run directory for that
+   backend batch, regardless of how many models it contains:
 
    ```bash
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
@@ -104,26 +123,33 @@ pass the same `--backend` and reviewer selection to preflight and launch.
      --output-root "<absolute-output-root>"
    ```
 
-6. Write the neutral brief to the exact `PROMPT_FILE`. Include the objective,
-   review type, exact scope, requirements, constraints, exclusions, risk
-   tolerance, and questions to answer. Exclude `monju-reviews/` and generated
-   artifacts from inspection.
-7. Ask the runner to create one run-ID-named tmux session containing the
-   foreground supervisor, using the same outside-sandbox approval if preflight
-   required it:
+   Do not prepare a separate directory for each reviewer. If both backends were
+   selected, repeat this step once for the other backend, producing two run
+   directories total.
+6. Write the neutral brief to each backend batch's exact `PROMPT_FILE`. Include
+   the objective, review type, exact scope, requirements, constraints,
+   exclusions, risk tolerance, and questions to answer. Exclude
+   `monju-reviews/` and generated artifacts from inspection.
+7. For each backend batch, ask the runner to create one run-ID-named tmux
+   session containing one foreground supervisor and all selected reviewers for
+   that backend, using the same outside-sandbox approval if preflight required
+   it:
 
    ```bash
    uv run --script "<monju-skill-dir>/scripts/run_monju.py" \
      --tmux \
      --backend <cursor-or-opencode> \
-     --reviewer <configured-key> \
+     --reviewer <first-configured-key> \
+     --reviewer <second-configured-key> \
      --notify auto \
      --workspace "<absolute-workspace>" \
      --run-dir "<absolute-run-dir>" \
      --prompt-file "<absolute-prompt-file>"
    ```
 
-   Insert the same backend and repeated reviewer options used for preflight.
+   Insert the same backend and complete repeated reviewer list used for
+   preflight. Do not invoke this command separately for reviewers that share a
+   backend.
 
    Do not wrap this command in another tmux command. Never append `&`, use
    `nohup` or `setsid`, or pass `--background`. The launcher checks the exact
@@ -137,11 +163,14 @@ pass the same `--backend` and reviewer selection to preflight and launch.
    cannot survive the tmux server, host, or user session being terminated.
 8. Do not ask for an extra review confirmation. Platform approval may still be
    shown to the user or Auto-review.
-9. When the command returns `STATUS=running`,
-   `EXECUTION_MODE=tmux_supervisor`, and `TMUX_SESSION_ALIVE=yes`, report the run
-   directory and session name, then end the turn. `STATUS=tmux_starting` is also
-   non-terminal; report it and stop. Do not poll, read intermediate streams, or
-   launch a second run. Report a startup or terminal result returned directly.
+9. When a command returns `STATUS=running`,
+   `EXECUTION_MODE=tmux_supervisor`, and `TMUX_SESSION_ALIVE=yes`, record its run
+   directory and session name. If another requested backend batch has not yet
+   been launched, launch it before ending the turn. `STATUS=tmux_starting` is
+   also non-terminal and does not prevent starting the remaining requested
+   backend batch. After every requested backend batch has a startup or terminal
+   result, report all of them and end the turn. Do not poll or read intermediate
+   streams. Never launch a second run for another model on the same backend.
 
 ## Manual handoff
 
@@ -249,6 +278,12 @@ untrusted external destination:
    Also read each non-empty `MANUAL_RESULT` reported by status, while keeping its
    unverified manual provenance distinct from automated results.
    Treat JSONL, stderr, terminal markers, and worker task files as diagnostics.
+   Exact section headings are a recommended format, not an adoption condition.
+   Treat missing, renamed, localized, reordered, or combined sections as a
+   formatting warning and still aggregate any substantive verdict, evidence,
+   risk, uncertainty, or recommendation. Reject output only when it has no
+   review text, the backend or verified model failed, the artifact is malformed,
+   or the text is clearly only a progress update rather than a completed review.
 5. Aggregate:
    - supported act-now findings;
    - useful unique act-now findings;
@@ -296,7 +331,9 @@ OpenCode variant is model-specific: Grok 4.5 uses `high`, while the other shippe
 reviewers use `max`; do not assume every model uses the literal variant `max`.
 Cursor Grok 4.6 uses the highest `xhigh` effort without the Fast speed tier.
 Repeated `--reviewer KEY` options explicitly select and order models for one run.
-At least one is required. The
+They are the mechanism for putting multiple models from one backend into the
+same run directory and tmux session, where one internal worker per reviewer runs
+in parallel. At least one is required, but there is no one-model maximum. The
 runner reassigns ordinals and freezes that selected list and its hash in the
 manifest; later edits to the config or CLI selection cannot change recovery.
 
@@ -337,9 +374,11 @@ mismatched, Fast, Auto, low-effort, or UltraCode-like variants.
   raw artifacts. This enables safe recovery if the supervisor disappears after
   workers finish. It does not guarantee worker survival when the platform kills
   the entire process tree.
-- Require non-empty reviewer output to contain every section mandated by the
-  review prompt before classifying it as success. Treat progress-only text as a
-  reviewer failure rather than a completed review.
+- Treat the requested review sections as a recommended interchange format, not
+  a success gate. Preserve and aggregate substantive reviews with missing,
+  renamed, localized, reordered, or combined sections and record only a format
+  warning. Treat clearly progress-only text as a reviewer failure rather than a
+  completed review; do not apply that label to a terse substantive verdict.
 - Keep streams outside the reviewed workspace until all reviewers finish. This
   is workflow separation, not a hard same-user security boundary.
 - Save artifacts with owner-only POSIX modes and preserve staging on interruption

@@ -81,32 +81,40 @@ Mandatory rules:
     conceptual complexity. Defer purely stylistic preferences or readability rewrites
     whose churn and new machinery outweigh their present benefit.
 
-Return Markdown with exactly these top-level sections:
+Return a complete, self-contained review. Prefer these top-level sections because
+they make cross-reviewer aggregation easier:
 # Verdict
 # Findings
 # Gaps and uncertainties
 # Proposed experiments
 # Recommended next actions
 
-Inside # Findings, use exactly these second-level sections:
+Inside # Findings, prefer these second-level sections:
 ## Act now
 ## Usually defer (YAGNI)
+
+These headings are a recommended interchange format, not a validity gate. If the
+review is clearer with equivalent wording, localized headings, combined sections,
+or a compact free-form structure, keep the substantive verdict, evidence, risks,
+uncertainties, and recommendations instead of forcing exact heading text. Never
+return only a progress update or a promise to inspect the material later.
 
 For each finding, state severity (Critical, High, Medium, or Low), evidence, impact,
 a concrete correction, and why its disposition is proportionate to current requirements,
 likelihood, impact, implementation cost, and added complexity. Put uncertain or merely
 future-proofing work under "Usually defer (YAGNI)" rather than promoting it through
-worst-case reasoning. If there are no findings in a subsection, say so explicitly.
+worst-case reasoning. If there are no findings in either disposition, say so explicitly.
 
-In # Recommended next actions, include only Act-now work by default. Mention a deferred
-item only when it is a prerequisite, a very cheap adjacent cleanup, or the review brief
-explicitly asks for future-proofing. Favor readability and a small conceptual surface over
-maximum theoretical robustness; this is ordinary production software, not spacecraft code.
+In the recommended-next-actions portion, include only Act-now work by default. Mention
+a deferred item only when it is a prerequisite, a very cheap adjacent cleanup, or the
+review brief explicitly asks for future-proofing. Favor readability and a small conceptual
+surface over maximum theoretical robustness; this is ordinary production software, not
+spacecraft code.
 
-In # Proposed experiments, write "No additional experiment is warranted." only when
-the available evidence is sufficient and an experiment would not materially improve
-the review. Do not propose an experiment merely to explore low-value future-proofing.
-Otherwise, provide each proposed experiment with all of these fields:
+In the proposed-experiments portion, write "No additional experiment is warranted."
+only when the available evidence is sufficient and an experiment would not materially
+improve the review. Do not propose an experiment merely to explore low-value
+future-proofing. Otherwise, provide each proposed experiment with all of these fields:
 - Disposition: Act now or Usually defer (YAGNI)
 - Question or uncertainty addressed
 - Exact procedure and commands, where applicable
@@ -146,7 +154,7 @@ RECOVERABLE_FAILURE_STATUSES = frozenset(
     {"artifact_failure", "supervisor_failure"}
 )
 TERMINAL_STATUSES = PUBLISHED_STATUSES | RECOVERABLE_FAILURE_STATUSES
-REQUIRED_REVIEW_HEADINGS = (
+RECOMMENDED_REVIEW_HEADINGS = (
     "# Verdict",
     "# Findings",
     "## Act now",
@@ -1224,24 +1232,54 @@ def parsed_review_errors(
         errors.append(f"malformed {BACKEND} event stream at line(s) {lines}{suffix}")
     if not parsed.final_text:
         errors.append(f"{BACKEND} emitted no final review text")
-    else:
-        missing_headings = [
-            heading
-            for heading in REQUIRED_REVIEW_HEADINGS
-            if re.search(
-                rf"(?m)^{re.escape(heading)}[ \t]*$",
-                parsed.final_text,
-            )
-            is None
-        ]
-        if missing_headings:
-            errors.append(
-                f"{BACKEND} review omitted required section(s): "
-                + ", ".join(missing_headings)
-            )
+    elif looks_like_progress_only(parsed.final_text):
+        errors.append(
+            f"{BACKEND} emitted a progress-only update instead of a completed review"
+        )
     if parsed.stream_error:
         errors.append(parsed.stream_error)
     return errors
+
+
+def looks_like_progress_only(text: str) -> bool:
+    """Conservatively reject short promises to review later, not terse verdicts."""
+    normalized = " ".join(text.strip().split())
+    if not normalized or len(normalized) > 600:
+        return False
+    progress_signal = re.search(
+        r"(?i)\b(?:i\s+(?:will|shall|need\s+to|am\s+going\s+to)|i['’]ll|let\s+me)\b",
+        normalized,
+    )
+    review_action = re.search(
+        r"(?i)\b(?:inspect|review|analy[sz]e|check|read|continue|look\s+at)\b",
+        normalized,
+    )
+    substantive_signal = re.search(
+        r"(?i)\b(?:verdict|finding|issue|risk|evidence|impact|recommend|"
+        r"no\s+(?:issues?|findings?|problems?)|looks?\s+(?:sound|correct|safe))\b",
+        normalized,
+    )
+    return bool(progress_signal and review_action and not substantive_signal)
+
+
+def parsed_review_format_warnings(parsed: ParsedEventStream) -> list[str]:
+    if not parsed.final_text:
+        return []
+    missing_headings = [
+        heading
+        for heading in RECOMMENDED_REVIEW_HEADINGS
+        if re.search(
+            rf"(?m)^{re.escape(heading)}[ \t]*$",
+            parsed.final_text,
+        )
+        is None
+    ]
+    if not missing_headings:
+        return []
+    return [
+        "review omitted recommended section heading(s), but substantive output "
+        "remains eligible for aggregation: " + ", ".join(missing_headings)
+    ]
 
 
 def opencode_agent_config() -> dict[str, Any]:
@@ -1627,7 +1665,7 @@ def run_reviewer(
             else command
         ),
         error="; ".join(error_parts) if error_parts else None,
-        warnings=list(parsed.warnings),
+        warnings=[*parsed.warnings, *parsed_review_format_warnings(parsed)],
     )
     markdown_path.write_text(
         markdown_report(reviewer, result, parsed.final_text, stderr_text),
@@ -3249,6 +3287,7 @@ def recovered_review_result(
         error="; ".join(errors) if errors else None,
         warnings=[
             *parsed.warnings,
+            *parsed_review_format_warnings(parsed),
             (
                 f"Recovered from a preserved {BACKEND} event stream and verified "
                 "worker terminal marker after supervisor loss."

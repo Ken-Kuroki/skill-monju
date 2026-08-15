@@ -33,8 +33,12 @@ models and accepted `system/init` identities are controlled by
 Monju never chooses a backend or model by default. Before every launch, the
 calling agent must ask which exact backend/model pairs to use. The CLI enforces
 this with a required `--backend cursor|opencode` and at least one repeated
-`--reviewer KEY`. One run uses one backend; models from both backends require
-separate runs so provenance remains unambiguous.
+`--reviewer KEY`. The backend boundary is per run, not per model or conversation
+turn. Put every selected model from the same backend into one run by repeating
+`--reviewer`; that run has one directory, one supervisor, and one tmux session,
+with one parallel worker per model. Never create a run or folder per model.
+Models from both backends require exactly one run per backend so provenance
+remains unambiguous; both backend runs can be started in the same launch turn.
 
 > **Usage warning:** A run with all five configured OpenCode reviewers at these highest
 > reasoning variants can consume roughly an entire five-hour OpenCode Go usage
@@ -144,7 +148,10 @@ identity match.
 
 Use repeated `--reviewer KEY` options to select exact models. Keys come from the
 chosen backend's configuration and option order determines artifact order.
-Omission is rejected. Use the same backend and selection for preflight and launch:
+Omission is rejected. All selected models from the same backend belong in this
+one command and later in one launch command; do not run preflight, prepare, or
+launch separately per model. Use the same backend and complete selection for
+preflight and launch:
 
 ```bash
 uv run --script scripts/run_monju.py \
@@ -206,10 +213,12 @@ uv run --script scripts/run_monju.py \
   --output-root /absolute/path/to/workspace/monju-reviews
 ```
 
-The command prints a collision-free `RUN_DIR` and `PROMPT_FILE`. Write one
-neutral brief to that file. The brief should contain scope, requirements,
-constraints, exclusions, risk tolerance, and concrete questions, while
-excluding `monju-reviews/` from inspection.
+The command prints a collision-free `RUN_DIR` and `PROMPT_FILE`. Run it once for
+all selected models on a backend, not once per model. Write one neutral brief to
+that file. The brief should contain scope, requirements, constraints,
+exclusions, risk tolerance, and concrete questions, while excluding
+`monju-reviews/` from inspection. If both backends are selected, prepare one run
+directory per backend.
 
 ### 3. Launch
 
@@ -218,16 +227,16 @@ uv run --script scripts/run_monju.py \
   --tmux \
   --backend opencode \
   --reviewer kimi-k3 \
-  --backend opencode \
-  --reviewer kimi-k3 \
+  --reviewer qwen3-8-max \
   --notify auto \
   --workspace /absolute/path/to/workspace \
   --run-dir /absolute/path/to/run \
   --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
 
-Use exactly the same `--backend` and repeated `--reviewer KEY` options as
-preflight.
+Use exactly the same `--backend` and complete repeated `--reviewer KEY` list as
+preflight. This single command starts both example models in parallel within the
+same run directory and tmux session.
 
 The runner creates a tmux session whose exact name is the run ID and starts the
 supervisor there without a shell. Do not wrap the command in another tmux
@@ -241,8 +250,10 @@ TMUX_SESSION=<run-id>
 TMUX_SESSION_ALIVE=yes
 ```
 
-end the conversation turn without polling. `STATUS=tmux_starting` is also
-non-terminal and should be checked once in a later turn. The supervisor writes
+Record the startup and continue launching the other backend's prepared run if
+the user selected both backends. End the conversation turn without polling only
+after every requested backend run has been started. `STATUS=tmux_starting` is
+also non-terminal and should be checked once in a later turn. The supervisor writes
 a flushed line to its owner-only runner log about every 30 seconds:
 
 ```text
@@ -298,10 +309,13 @@ the supervisor fails while valid staging survives, the same command can validate
 and retry publication; status does not call such a run published. Genuinely
 published terminal manifests make later recovery a read-only no-op.
 
-Exit code zero and arbitrary text are not sufficient for reviewer success. The
-result must contain all sections required by the shared review prompt, preventing
-progress messages such as "I will inspect the files" from becoming a successful
-empty review.
+Exit code zero and arbitrary text are not sufficient for reviewer success, but
+exact section headings are not an acceptance gate. Missing, renamed, localized,
+reordered, or combined sections produce a format warning while substantive
+review text remains a successful result and is eligible for aggregation. Only
+empty output, backend/model/artifact failures, malformed streams, and clearly
+progress-only messages such as "I will inspect the files" are rejected. A terse
+substantive verdict is not progress-only.
 
 DeepSeek V4 Pro or Flash may return a non-retryable HTTP 403 `RegionError` when
 the selected version is hosted only in China and the OpenCode workspace has not
@@ -468,7 +482,12 @@ Cursorでは`kimi-k3-max`、`cursor-grok-4.6-xhigh`、`claude-fable-5-thinking-m
 Monjuはbackendやモデルを既定選択しません。起動前に、どのモデルをCursorと
 OpenCodeのどちら経由で使うか、正確な組み合わせをユーザーへ確認します。CLIでも
 `--backend cursor|opencode`と1件以上の`--reviewer KEY`が必須です。1つのrunでは
-1つのbackendだけを使い、両方を使う場合はprovenanceを分けた2つのrunにします。
+1つのbackendだけを使いますが、これはmodel数や会話turnの制限ではありません。同じ
+backendで選んだmodelはすべて、`--reviewer`を繰り返して1つのrunへまとめます。run
+directory、supervisor、tmux sessionはそれぞれ1つで、modelごとのworkerが内部で並列に
+動きます。modelごとにrunやfolderを作ってはいけません。両backendを使う場合だけ、
+provenanceを分けてbackendごとに1つ、合計2つのrunを作り、同じ起動turn内で両方を
+startできます。
 
 > **利用量の注意:** 既定の5レビュアーを上記の最高推論variantで動かすと、OpenCode
 > Goの5時間利用枠を1回の実行でほぼ使い切る可能性があります。レビューの実時間が
@@ -569,8 +588,9 @@ Cursorは`cursor_reviewers.json`を使います。各entryの`model_id`をCLIへ
 `agent models`も確認します。
 
 `--reviewer KEY`を繰り返して正確なモデルを選択します。KEYは選んだbackendの設定にある
-値です。指定順が成果物の順番になり、省略は拒否されます。preflightと起動には同じ
-backendと選択を渡してください。
+値です。指定順が成果物の順番になり、省略は拒否されます。同じbackendで選んだmodelは
+すべて1つのcommandに含め、modelごとにpreflight、prepare、launchを分けてはいけません。
+preflightと起動には同じbackendと完全な選択listを渡してください。
 
 ```bash
 uv run --script scripts/run_monju.py \
@@ -627,27 +647,34 @@ uv run --script scripts/run_monju.py \
   --output-root /absolute/path/to/workspace/monju-reviews
 ```
 
-commandは衝突しない`RUN_DIR`と`PROMPT_FILE`を出力します。そのファイルへscope、要件、
-制約、除外事項、risk tolerance、具体的な質問を含むneutral briefを1つ書きます。
-review対象から`monju-reviews/`を除外してください。
+commandは衝突しない`RUN_DIR`と`PROMPT_FILE`を出力します。同じbackendで選んだmodel数に
+関係なく、このcommandは1回だけ実行します。modelごとに別のrun directoryを作っては
+いけません。そのファイルへscope、要件、制約、除外事項、risk tolerance、具体的な質問を
+含むneutral briefを1つ書きます。review対象から`monju-reviews/`を除外してください。
+両backendを選んだ場合だけ、backendごとに1つずつprepareします。
 
 ### 3. 起動
 
 ```bash
 uv run --script scripts/run_monju.py \
   --tmux \
+  --backend opencode \
+  --reviewer kimi-k3 \
+  --reviewer qwen3-8-max \
   --notify auto \
   --workspace /absolute/path/to/workspace \
   --run-dir /absolute/path/to/run \
   --prompt-file /absolute/path/to/run/monju-...-00-review-brief.md
 ```
 
-preflightとまったく同じ`--backend`と`--reviewer KEY`をこの起動commandにも渡します。
+preflightとまったく同じ`--backend`と完全な`--reviewer KEY`の繰り返しを、この1つの
+起動commandへ渡します。上の例では2つのmodelが同じrun directoryとtmux session内で
+並列起動します。
 
 runnerはrun IDと同名のtmux sessionを作り、shellを介さずにsupervisorをforeground
 commandとして起動します。commandを別のtmuxで包んだり、`&`、`nohup`、`setsid`、
-`--background`を使ったりしません。launcherが次を返したらpollingせず、その会話
-ターンを終了します。
+`--background`を使ったりしません。launcherが次を返したら結果を記録し、両backendを
+選択していて未起動のbackend runがあれば、同じ会話turn内でそれも起動します。
 
 ```text
 STATUS=running
@@ -656,6 +683,7 @@ TMUX_SESSION=<run-id>
 TMUX_SESSION_ALIVE=yes
 ```
 
+要求されたbackend runをすべて起動してから、pollingせず会話turnを終了します。
 `STATUS=tmux_starting`も非終端状態なので、別ターンで一度だけ確認します。supervisorは
 約30秒ごとに次のheartbeatをowner-only runner logへflushします。
 
@@ -708,8 +736,11 @@ recoverはOpenCodeや外部LLMを呼ばず、モデル変更やretryも行いま
 supervisorだけが失敗し、有効なstagingが残っている場合は、同じ検証を通して公開を
 再試行できます。すでに終端manifestが公開済みなら、再recoverはread-onlyのno-opです。
 
-exit code 0でtextが存在するだけではreview成功にしません。共通promptで要求した全
-sectionが揃わない進捗文だけの出力はreviewer failureとして扱います。
+exit code 0で任意のtextが存在するだけではreview成功にしませんが、section見出しの
+完全一致は採用条件にしません。sectionの欠落、名称変更、日本語化、順序変更、統合は
+format warningだけを記録し、実質的なreview本文はsuccessとして集約対象に残します。
+拒否するのは、本文なし、backend・model・artifactのfailure、malformed stream、または
+「これから確認する」のような明白な進捗文だけです。短くても実質的なverdictは採用します。
 
 DeepSeek V4 ProまたはFlashは、選択されたversionが中国だけでホストされ、明示的な
 opt-inがない場合、再試行不能なHTTP 403 `RegionError`を返すことがあります。これは

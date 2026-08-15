@@ -1211,6 +1211,19 @@ class RunnerTestCase(unittest.TestCase):
                     "part": {"text": "I will inspect the remaining files next."},
                 }
                 exit_code = 0
+            elif state == "freeform":
+                event = {
+                    "type": "text",
+                    "sessionID": f"s-{reviewer.key}",
+                    "part": {
+                        "text": (
+                            "The implementation looks sound for the current scope. "
+                            "I found no actionable issues after reviewing the stated "
+                            "requirements and source evidence."
+                        )
+                    },
+                }
+                exit_code = 0
             elif state == "malformed":
                 events.write_text("not-json\n", encoding="utf-8")
                 event = None
@@ -1305,7 +1318,37 @@ class RunnerTestCase(unittest.TestCase):
             )
             result = payload["results"][0]
             self.assertEqual(result["status"], "failed")
-            self.assertIn("omitted required section", result["error"])
+            self.assertIn("progress-only update", result["error"])
+
+    def test_terse_substantive_verdict_is_not_progress_only(self) -> None:
+        self.assertFalse(run_monju.looks_like_progress_only("No issues found."))
+        self.assertFalse(
+            run_monju.looks_like_progress_only(
+                "Looks sound. I recommend keeping the implementation unchanged."
+            )
+        )
+
+    def test_substantive_freeform_review_is_success_with_format_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            key = run_monju.REVIEWERS[0].key
+            run_dir, _ = self.make_recovery_run(
+                Path(temporary), states={key: "freeform"}
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run_monju.recover_review(self.recovery_args(run_dir))
+            self.assertEqual(code, 0)
+            payload = json.loads(
+                (run_dir / f"{run_dir.name}-manifest.json").read_text()
+            )
+            result = payload["results"][0]
+            self.assertEqual(result["status"], "success")
+            self.assertIsNone(result["error"])
+            self.assertTrue(
+                any(
+                    "omitted recommended section heading" in warning
+                    for warning in result["warnings"]
+                )
+            )
 
     def test_recovery_uses_frozen_manifest_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
